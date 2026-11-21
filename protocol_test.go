@@ -2868,21 +2868,219 @@ func TestNewConnSkipPolicyConsumesHeaderWithoutUsing(t *testing.T) {
 	}
 }
 
-// TestWithBufferSizeTooSmallForV1Header pins the interaction documented on
-// WithBufferSize: v1 parsing requires the whole line buffered from a single
-// read, so a buffer smaller than the line rejects even a well-behaved v1
-// sender. (v2 refills freely and is unaffected.)
-func TestWithBufferSizeTooSmallForV1Header(t *testing.T) {
+// TestConnV1FragmentedHeaderAndPayload pins requirements 1 and 2 at the Conn
+// level: a v1 line split into byte-sized writes (and interleaved with the
+// application payload) is still parsed, the result is a stable accepted header,
+// and the payload is delivered byte-for-byte.
+func TestConnV1FragmentedHeaderAndPayload(t *testing.T) {
+	conn, peer := net.Pipe()
+	t.Cleanup(func() { _ = conn.Close(); _ = peer.Close() })
+
+	wire := []byte("PROXY TCP4 1.2.3.4 5.6.7.8 80 443\r\n" + testPingPayload)
+	go func() {
+		// One byte per write maximizes segmentation; each read may also return
+		// mid-line because net.Pipe delivers writes separately.
+		for _, b := range wire {
+			if _, err := peer.Write([]byte{b}); err != nil {
+				return
+			}
+		}
+	}()
+
+	c := NewConn(conn, WithPolicy(REQUIRE))
+	buf := make([]byte, len(testPingPayload))
+	if _, err := io.ReadFull(c, buf); err != nil {
+		t.Fatalf("fragmented v1 header failed to parse: %v", err)
+	}
+	if string(buf) != testPingPayload {
+		t.Fatalf("expected payload %q, got %q", testPingPayload, string(buf))
+	}
+	h := c.ProxyHeader()
+	if h == nil || h.Version != 1 || h.TransportProtocol != TCPv4 {
+		t.Fatalf("unexpected header: %+v", h)
+	}
+	if got := h.SourceAddr.String(); got != testHeaderSampleAddr {
+		t.Fatalf("unexpected source addr %q", got)
+	}
+	if got := c.RemoteAddr().String(); got != testHeaderSampleAddr {
+		t.Fatalf("RemoteAddr did not adopt the parsed header, got %q", got)
+	}
+}
+
+// TestConnRejectedHeaderIsStickyAndNotTreatedAsTraffic pins requirement 5 at
+// the Conn level: once a v1 line is rejected, the error is cached and every
+// subsequent Read fails identically, returning zero bytes — rejected header
+// bytes and any following data can never be reinterpreted as application
+// traffic on that connection.
+func TestConnRejectedHeaderIsStickyAndNotTreatedAsTraffic(t *testing.T) {
+	for _, tc := range []struct {
+		desc string
+		wire string
+		want error
+	}{
+		{"bare LF", "PROXY TCP4 1.2.3.4 5.6.7.8 80 443\nGET /", ErrLineMustEndWithCrlf},
+		{"unknown protocol", "PROXY FOO 1.2.3.4 5.6.7.8 80 443\r\nGET /", ErrCantReadAddressFamilyAndProtocol},
+		{"invalid port", "PROXY TCP4 1.2.3.4 5.6.7.8 notaport 443\r\nGET /", ErrInvalidPortNumber},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			conn, peer := net.Pipe()
+			t.Cleanup(func() { _ = conn.Close(); _ = peer.Close() })
+			go func() { _, _ = peer.Write([]byte(tc.wire)) }()
+
+			c := NewConn(conn, WithPolicy(REQUIRE))
+			buf := make([]byte, 64)
+			n, err := c.Read(buf)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("first Read: expected %v, got n=%d err=%v", tc.want, n, err)
+			}
+			if n != 0 {
+				t.Fatalf("rejected header must return zero bytes, got %d (%q)", n, buf[:n])
+			}
+			// Repeated Reads must surface the same cached reject and never leak
+			// the "GET /" payload.
+			for range 3 {
+				n, err = c.Read(buf)
+				if !errors.Is(err, tc.want) {
+					t.Fatalf("subsequent Read: expected %v, got n=%d err=%v", tc.want, n, err)
+				}
+				if n != 0 {
+					t.Fatalf("subsequent Read returned bytes from a rejected header: %q", buf[:n])
+				}
+			}
+			if h := c.ProxyHeader(); h != nil {
+				t.Fatalf("a rejected header must not be exposed, got %+v", h)
+			}
+			// Address accessors fall back to the socket instead of trusting the
+			// rejected declaration.
+			if c.RemoteAddr() != conn.RemoteAddr() {
+				t.Fatalf("RemoteAddr must not adopt a rejected header's address")
+			}
+		})
+	}
+}
+
+// TestConnV1MidHeaderTimeoutStable pins requirements 2 and 3 at the Conn
+// level: a client that stalls mid-line makes the first Read fail with
+// ErrNoProxyProtocol once the header-read deadline fires, and the outcome is
+// stable (the error is cached) rather than being mislabeled as a malformed
+// header.
+func TestConnV1MidHeaderTimeoutStable(t *testing.T) {
+	conn, peer := net.Pipe()
+	t.Cleanup(func() { _ = conn.Close(); _ = peer.Close() })
+
+	// Deliberately no CRLF: the client stalls after the opening fragment.
+	go func() {
+		_, _ = peer.Write([]byte("PROXY TCP4 1.2.3.4 5.6.7.8 80"))
+	}()
+
+	c := NewConn(conn, WithPolicy(REQUIRE), SetReadHeaderTimeout(100*time.Millisecond))
+	start := time.Now()
+	n, err := c.Read(make([]byte, 1))
+	elapsed := time.Since(start)
+	if !errors.Is(err, ErrNoProxyProtocol) {
+		t.Fatalf("expected ErrNoProxyProtocol on a mid-header timeout, got n=%d err=%v", n, err)
+	}
+	if n != 0 {
+		t.Fatalf("timed-out header read must return zero bytes, got %d", n)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("Read was not released by the header deadline: elapsed=%v", elapsed)
+	}
+
+	// The decision is sticky: later Reads return the same error without blocking.
+	for range 2 {
+		n, err = c.Read(make([]byte, 1))
+		if !errors.Is(err, ErrNoProxyProtocol) || n != 0 {
+			t.Fatalf("expected the timeout outcome to be cached, got n=%d err=%v", n, err)
+		}
+	}
+}
+
+// TestListenerV1FragmentedHeader pins the Listener path end to end: a header
+// arriving in separate TCP segments is accepted and the payload following it
+// is served intact.
+func TestListenerV1FragmentedHeader(t *testing.T) {
+	pl := &Listener{
+		Listener:          newLocalListener(t),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	cliResult := make(chan error, 1)
+	go func() {
+		c, err := net.Dial("tcp", pl.Addr().String())
+		if err != nil {
+			cliResult <- err
+			return
+		}
+		defer func() { _ = c.Close() }()
+		// Split the line into three arbitrary segments with a small pause so
+		// the server reads across multiple recvs.
+		segments := []string{
+			"PROXY TCP4 10.1.1.1 ",
+			"20.2.2.2 1000 ",
+			"2000\r\n",
+		}
+		for _, seg := range segments {
+			if _, err := c.Write([]byte(seg)); err != nil {
+				cliResult <- err
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if _, err := c.Write([]byte(testPingPayload)); err != nil {
+			cliResult <- err
+			return
+		}
+		close(cliResult)
+	}()
+
+	c, err := pl.Accept()
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	closeOnCleanup(t, "connection", c)
+
+	buf := make([]byte, len(testPingPayload))
+	if _, err := io.ReadFull(c, buf); err != nil {
+		t.Fatalf("fragmented header over the Listener failed: %v", err)
+	}
+	if string(buf) != testPingPayload {
+		t.Fatalf("expected payload %q, got %q", testPingPayload, string(buf))
+	}
+	if got := c.RemoteAddr().String(); got != testHeaderV4SourceAddr {
+		t.Fatalf("expected the parsed client address, got %q", got)
+	}
+	if err := <-cliResult; err != nil {
+		t.Fatalf("client error: %v", err)
+	}
+}
+
+// TestWithBufferSizeSmallerThanV1Header pins that v1 parsing refills the
+// buffer instead of requiring the whole line to fit in one read: a 16-byte
+// buffer accepts a 40-byte v1 line split across refills, and the payload
+// following the header is still delivered byte-for-byte. (The old
+// ErrCantReadVersion1Header slow-loris abort was removed when arbitrary
+// segmentation became supported.)
+func TestWithBufferSizeSmallerThanV1Header(t *testing.T) {
 	conn, peer := net.Pipe()
 	t.Cleanup(func() { _ = conn.Close(); _ = peer.Close() })
 	go func() {
-		// 40-byte v1 line sent atomically; only 16 bytes fit in the buffer.
+		// 40-byte v1 line sent atomically; only 16 bytes fit in the buffer, so
+		// the parser must refill at least twice.
 		_, _ = peer.Write([]byte("PROXY TCP4 1.2.3.4 5.6.7.8 80 443\r\nping"))
 	}()
 
 	c := NewConn(conn, WithPolicy(REQUIRE), WithBufferSize(16))
-	if _, err := c.Read(make([]byte, 4)); !errors.Is(err, ErrCantReadVersion1Header) {
-		t.Fatalf("expected ErrCantReadVersion1Header with an undersized buffer, got %v", err)
+	buf := make([]byte, len(testPingPayload))
+	if _, err := io.ReadFull(c, buf); err != nil {
+		t.Fatalf("expected a v1 line larger than the buffer to parse, got %v", err)
+	}
+	if string(buf) != testPingPayload {
+		t.Fatalf("expected the payload after the header, got %q", string(buf))
+	}
+	h := c.ProxyHeader()
+	if h == nil || h.SourceAddr == nil || h.SourceAddr.String() != testHeaderSampleAddr {
+		t.Fatalf("unexpected parsed header: %+v", h)
 	}
 }
 

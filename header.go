@@ -274,6 +274,13 @@ func (header *Header) SetTLVs(tlvs []TLV) error {
 // If proxy protocol header signature is present but an error is raised while processing
 // the remaining header, assume the reader buffer to be in a corrupt state.
 // Also, this operation will block until enough bytes are available for peeking.
+//
+// A read deadline firing while a (partial) v1 header is in flight is not treated
+// as a malformed header: the underlying net.Error timeout is returned unwrapped
+// (detectable with errors.As(err, new(net.Error))) and any bytes already
+// buffered but not yet consumed stay in the reader, so the caller can
+// distinguish "timed out" from "rejected" and decide whether to retry or close
+// the connection.
 func Read(reader *bufio.Reader) (*Header, error) {
 	// In order to improve speed for small non-PROXYed packets, take a peek at the first byte alone.
 	b1, err := reader.Peek(1)
@@ -375,7 +382,11 @@ func ReadHeaderTimeout(conn net.Conn, reader *bufio.Reader, timeout time.Duratio
 	}
 
 	header, err := Read(reader)
-	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+	// errors.As reaches the net.Error through any parse/transport wrapper: a
+	// timeout that fires mid-header must mean "no header in time", not a parse
+	// failure.
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
 		return nil, ErrNoProxyProtocol
 	}
 	return header, err

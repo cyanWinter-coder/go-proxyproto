@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	"math"
 	"net"
@@ -81,8 +80,8 @@ type _addrUnix struct {
 func parseVersion2(reader *bufio.Reader) (header *Header, err error) {
 	// Skip first 12 bytes (signature)
 	for range 12 {
-		if _, err = reader.ReadByte(); err != nil {
-			return nil, fmt.Errorf("%w: %w", ErrCantReadProtocolVersionAndCommand, err)
+		if _, err = readByteOrHeaderTimeout(reader, ErrCantReadProtocolVersionAndCommand); err != nil {
+			return nil, err
 		}
 	}
 
@@ -90,9 +89,9 @@ func parseVersion2(reader *bufio.Reader) (header *Header, err error) {
 	header.Version = 2
 
 	// Read the 13th byte, protocol version and command
-	b13, err := reader.ReadByte()
+	b13, err := readByteOrHeaderTimeout(reader, ErrCantReadProtocolVersionAndCommand)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrCantReadProtocolVersionAndCommand, err)
+		return nil, err
 	}
 	header.Command = ProtocolVersionAndCommand(b13)
 	if _, ok := supportedCommand[header.Command]; !ok {
@@ -100,9 +99,9 @@ func parseVersion2(reader *bufio.Reader) (header *Header, err error) {
 	}
 
 	// Read the 14th byte, address family and protocol
-	b14, err := reader.ReadByte()
+	b14, err := readByteOrHeaderTimeout(reader, ErrCantReadAddressFamilyAndProtocol)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrCantReadAddressFamilyAndProtocol, err)
+		return nil, err
 	}
 	header.TransportProtocol = AddressFamilyAndProtocol(b14)
 	// Per spec (section 2.2) only the listed address family / transport protocol
@@ -130,7 +129,7 @@ func parseVersion2(reader *bufio.Reader) (header *Header, err error) {
 	// Make sure there are bytes available as specified in length
 	var length uint16
 	if err := binary.Read(reader, binary.BigEndian, &length); err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrCantReadLength, err)
+		return nil, wrapHeaderReadError(ErrCantReadLength, err)
 	}
 
 	if !header.validateLength(length) {
@@ -151,7 +150,7 @@ func parseVersion2(reader *bufio.Reader) (header *Header, err error) {
 				return nil, ErrInvalidLength
 			}
 			if _, err := reader.Discard(int(length)); err != nil {
-				return nil, fmt.Errorf("%w: %w", ErrInvalidLength, err)
+				return nil, wrapHeaderReadError(ErrInvalidLength, err)
 			}
 			header.TransportProtocol = UNSPEC
 			return header, nil
@@ -179,21 +178,21 @@ func parseVersion2(reader *bufio.Reader) (header *Header, err error) {
 		if header.TransportProtocol.IsIPv4() {
 			var addr _addr4
 			if err := binary.Read(payloadReader, binary.BigEndian, &addr); err != nil {
-				return nil, fmt.Errorf("%w: %w", ErrInvalidAddress, err)
+				return nil, wrapHeaderReadError(ErrInvalidAddress, err)
 			}
 			header.SourceAddr = newIPAddr(header.TransportProtocol, addr.Src[:], addr.SrcPort)
 			header.DestinationAddr = newIPAddr(header.TransportProtocol, addr.Dst[:], addr.DstPort)
 		} else if header.TransportProtocol.IsIPv6() {
 			var addr _addr6
 			if err := binary.Read(payloadReader, binary.BigEndian, &addr); err != nil {
-				return nil, fmt.Errorf("%w: %w", ErrInvalidAddress, err)
+				return nil, wrapHeaderReadError(ErrInvalidAddress, err)
 			}
 			header.SourceAddr = newIPAddr(header.TransportProtocol, addr.Src[:], addr.SrcPort)
 			header.DestinationAddr = newIPAddr(header.TransportProtocol, addr.Dst[:], addr.DstPort)
 		} else if header.TransportProtocol.IsUnix() {
 			var addr _addrUnix
 			if err := binary.Read(payloadReader, binary.BigEndian, &addr); err != nil {
-				return nil, fmt.Errorf("%w: %w", ErrInvalidAddress, err)
+				return nil, wrapHeaderReadError(ErrInvalidAddress, err)
 			}
 
 			network := networkUnix

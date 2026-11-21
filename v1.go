@@ -3,6 +3,7 @@ package proxyproto
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -14,6 +15,16 @@ import (
 const (
 	crlf      = "\r\n"
 	separator = " "
+
+	// maxV1HeaderSize is the maximum length of a v1 header line including the
+	// terminating CRLF. Per the spec, the worst case is:
+	//
+	//	"PROXY UNKNOWN ffff:f...f:ffff ffff:f...f:ffff 65535 65535\r\n"
+	//	=> 5 + 1 + 7 + 1 + 39 + 1 + 39 + 1 + 5 + 1 + 5 + 2 = 107 chars
+	//
+	// A 108-byte buffer would therefore always hold a whole line, and a line
+	// whose 108th byte is not a LF is rejected with ErrVersion1HeaderTooLong.
+	maxV1HeaderSize = 107
 
 	// v1ProtoTCP4 and v1ProtoTCP6 are the PROXY protocol v1 transport-protocol
 	// tokens for TCP over IPv4 and IPv6 respectively (net has no constants for
@@ -45,70 +56,74 @@ func initVersion1() *Header {
 	return header
 }
 
+// readByteOrHeaderTimeout performs a bufio.Reader.ReadByte that keeps a read
+// deadline firing distinguishable from a malformed header: a net.Error timeout
+// (or any net.Error implementing Timeout()) is returned unwrapped, while every
+// other read failure — clean EOF on a truncated line included — is wrapped
+// with formatErr. v1 and v2 share it so both parsers give callers the same
+// "timed out vs. rejected" classification (errors.As works on the result
+// either way).
+func readByteOrHeaderTimeout(reader *bufio.Reader, formatErr error) (byte, error) {
+	b, err := reader.ReadByte()
+	if err != nil {
+		return 0, wrapHeaderReadError(formatErr, err)
+	}
+	return b, nil
+}
+
+// wrapHeaderReadError keeps a read-deadline failure distinguishable from a
+// malformed header: a net.Error timeout is returned unwrapped, while every
+// other read failure (clean EOF on a truncated frame included) is wrapped with
+// formatErr. Both v1 and v2 route their read failures through it so callers
+// get one classification rule, and errors.As still finds the underlying cause
+// of a wrapped failure.
+func wrapHeaderReadError(formatErr, err error) error {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return err
+	}
+	return fmt.Errorf("%w: %w", formatErr, err)
+}
+
 func parseVersion1(reader *bufio.Reader) (*Header, error) {
-	//The header cannot be more than 107 bytes long. Per spec:
+	// The spec derives the 107-byte line limit (see maxV1HeaderSize) and mandates
+	// CRLF termination; the header never otherwise contains a CR or LF byte.
 	//
-	//   (...)
-	//   - worst case (optional fields set to 0xff) :
-	//     "PROXY UNKNOWN ffff:f...f:ffff ffff:f...f:ffff 65535 65535\r\n"
-	//     => 5 + 1 + 7 + 1 + 39 + 1 + 39 + 1 + 5 + 1 + 5 + 2 = 107 chars
+	// Edge connections frequently deliver the line split across arbitrarily
+	// small TCP segments, and a slow client may pause before the CRLF, so the
+	// read loop is tolerant of partial lines instead of requiring the line to
+	// arrive from a single underlying read. Three independent bounds make that
+	// tolerance safe against stalled or abusive peers:
 	//
-	//   So a 108-byte buffer is always enough to store all the line and a
-	//   trailing zero for string processing.
+	//   - the first LF byte ends the line (and must be preceded by CR);
+	//   - maxV1HeaderSize caps how many bytes may belong to the line, so a peer
+	//     sending delimiter-free data is rejected with ErrVersion1HeaderTooLong;
+	//   - the caller's read deadline bounds how long a stalled peer can hold the
+	//     loop. A deadline firing is not a format error: the net.Error timeout is
+	//     returned unwrapped so errors.As(err, new(net.Error)) distinguishes it
+	//     from a genuinely malformed header, leaving the caller free to retry or
+	//     drop the connection.
 	//
-	// It must also be CRLF terminated, as above. The header does not otherwise
-	// contain a CR or LF byte.
-	//
-	// ISSUE #69
-	// We can't use Peek here as it will block trying to fill the buffer, which
-	// will never happen if the header is TCP4 or TCP6 (max. 56 and 104 bytes
-	// respectively) and the server is expected to speak first.
-	//
-	// Similarly, we can't use ReadString or ReadBytes as these will keep reading
-	// until the delimiter is found; an abusive client could easily disrupt a
-	// server by sending a large amount of data that do not contain a LF byte.
-	// Another means of attack would be to start connections and simply not send
-	// data after the initial PROXY signature bytes, accumulating a large
-	// number of blocked goroutines on the server. ReadSlice will also block for
-	// a delimiter when the internal buffer does not fill up.
-	//
-	// A plain Read is also problematic since we risk reading past the end of the
-	// header without being able to easily put the excess bytes back into the reader's
-	// buffer (with the current implementation's design).
-	//
-	// So we use a ReadByte loop, which solves the overflow problem and avoids
-	// reading beyond the end of the header. However, we need one more trick to harden
-	// against partial header attacks (slow loris) - per spec:
-	//
-	//    (..) The sender must always ensure that the header is sent at once, so that
-	//    the transport layer maintains atomicity along the path to the receiver. The
-	//    receiver may be tolerant to partial headers or may simply drop the connection
-	//    when receiving a partial header. Recommendation is to be tolerant, but
-	//    implementation constraints may not always easily permit this.
-	//
-	// We are subject to such implementation constraints. So we return an error if
-	// the header cannot be fully extracted with a single read of the underlying
-	// reader.
-	buf := make([]byte, 0, 107)
+	// Only bytes consumed while looking for the LF leave the reader. Any payload
+	// that arrived in the same TCP segment(s) as the line stays buffered, so a
+	// well-formed header never swallows the application's first packet. A
+	// malformed header, on the other hand, is rejected outright: its bytes are
+	// never reinterpreted as application data (Conn caches the error and every
+	// subsequent Read fails the same way).
+	buf := make([]byte, 0, maxV1HeaderSize)
 	for {
-		b, err := reader.ReadByte()
+		b, err := readByteOrHeaderTimeout(reader, ErrCantReadVersion1Header)
 		if err != nil {
-			return nil, fmt.Errorf("%w: %w", ErrCantReadVersion1Header, err)
+			return nil, err
 		}
 		buf = append(buf, b)
 		if b == '\n' {
 			// End of header found
 			break
 		}
-		if len(buf) == 107 {
-			// No delimiter in first 107 bytes
+		if len(buf) == maxV1HeaderSize {
+			// No delimiter within the maximum header length.
 			return nil, ErrVersion1HeaderTooLong
-		}
-		if reader.Buffered() == 0 {
-			// Header was not buffered in a single read. Since we can't
-			// differentiate between genuine slow writers and DoS agents,
-			// we abort. On healthy networks, this should never happen.
-			return nil, ErrCantReadVersion1Header
 		}
 	}
 
@@ -142,7 +157,10 @@ func parseVersion1(reader *bufio.Reader) (*Header, error) {
 	case "UNKNOWN":
 		transportProtocol = UNSPEC // doesn't exist in v1 but fits UNKNOWN
 	default:
-		return nil, ErrCantReadAddressFamilyAndProtocol
+		// Reject rather than guess: the token names no supported family, so no
+		// SourceAddr/DestinationAddr may be fabricated. Keep the raw token in the
+		// error so the sender's original declaration is not lost to the receiver.
+		return nil, fmt.Errorf("%w: %q", ErrCantReadAddressFamilyAndProtocol, tokens[1])
 	}
 
 	// Expect exactly 6 tokens when UNKNOWN is not present. The spec's TCP4/TCP6

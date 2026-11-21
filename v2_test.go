@@ -809,3 +809,41 @@ func Test_formatUnixName(t *testing.T) {
 		t.Errorf("formatUnixName() short prefix = %q, want prefix %q", shortFormatted, shortName)
 	}
 }
+
+// TestParseV2TimeoutIsNotFormatError pins that a read deadline firing while a
+// v2 frame is still being read is a timeout, not a format error: the net.Error
+// must reach the caller unwrapped so it can be distinguished from a malformed
+// frame. Mirrors TestParseV1TimeoutIsNotFormatError for the v1 parser.
+func TestParseV2TimeoutIsNotFormatError(t *testing.T) {
+	// Full signature plus the command byte; the family byte read then stalls.
+	prefix := append(bytes.Clone(SIGV2), byte(PROXY))
+	reader := bufio.NewReader(&prefixTimeoutReader{prefix: prefix})
+
+	_, err := Read(reader)
+	if err == nil {
+		t.Fatal("expected an error when the deadline fires mid-frame")
+	}
+	var netErr net.Error
+	if !errors.As(err, &netErr) || !netErr.Timeout() {
+		t.Fatalf("expected a net.Error timeout, got %v (%T)", err, err)
+	}
+	if errors.Is(err, ErrCantReadProtocolVersionAndCommand) ||
+		errors.Is(err, ErrCantReadAddressFamilyAndProtocol) ||
+		errors.Is(err, ErrCantReadLength) {
+		t.Fatalf("a timeout must not be classified as a v2 format error, got %v", err)
+	}
+}
+
+// TestParseV2TruncatedFrameIsReadError pins that a clean EOF inside a v2 frame
+// remains a wrapped read/format failure rather than a timeout.
+func TestParseV2TruncatedFrameIsReadError(t *testing.T) {
+	reader := newBufioReader(append(bytes.Clone(SIGV2), byte(PROXY)))
+	_, err := Read(reader)
+	if !errors.Is(err, ErrCantReadAddressFamilyAndProtocol) {
+		t.Fatalf("expected ErrCantReadAddressFamilyAndProtocol for an EOF-truncated frame, got %v", err)
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		t.Fatalf("EOF truncation must not classify as a timeout, got %v", err)
+	}
+}

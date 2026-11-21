@@ -23,9 +23,11 @@ import (
 func ParseUDPDatagram(datagram []byte) (*Header, []byte, error) {
 	byteReader := bytes.NewReader(datagram)
 	// Size the buffer to the whole datagram so the header is fully buffered up
-	// front: v1 parsing aborts if the header is not available in a single read,
-	// and a datagram, unlike a stream, can never deliver more bytes later.
-	// bufio enforces a minimum buffer size internally, covering len == 0.
+	// front. Stream parsing tolerates segmentation by refilling, but a datagram
+	// is a fixed, self-contained unit: once its bytes are exhausted there is no
+	// later delivery to refill from, and the reader then reports EOF. Buffering
+	// all of it keeps a complete header parseable in the one pass a datagram
+	// allows. bufio enforces a minimum buffer size internally, covering len == 0.
 	reader := bufio.NewReaderSize(byteReader, len(datagram))
 	header, err := Read(reader)
 	if err != nil {

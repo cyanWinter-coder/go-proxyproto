@@ -432,12 +432,20 @@ func TestParseVersion1Overflow(t *testing.T) {
 	}
 }
 
-func listen(t *testing.T) *Listener {
+// listen binds a localhost TCP listener wrapped in a Listener. When
+// readHeaderTimeout > 0 the Listener is given that header timeout, which lets
+// tests pin the deadline-bound (rather than single-read) behavior without
+// waiting for DefaultReadHeaderTimeout.
+func listen(t *testing.T, readHeaderTimeout ...time.Duration) *Listener {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	return &Listener{Listener: l}
+	pl := &Listener{Listener: l}
+	if len(readHeaderTimeout) > 0 {
+		pl.ReadHeaderTimeout = readHeaderTimeout[0]
+	}
+	return pl
 }
 
 func client(t *testing.T, addr, header string, length int, terminate bool, wait time.Duration, done chan struct{},
@@ -496,8 +504,8 @@ func TestVersion1Overflow(t *testing.T) {
 
 	b := []byte{}
 	_, err = c.Read(b)
-	if err == nil {
-		t.Fatalf("net.Conn: no error reported for oversized header")
+	if !errors.Is(err, ErrVersion1HeaderTooLong) {
+		t.Fatalf("net.Conn: expected ErrVersion1HeaderTooLong for oversized header, got %v", err)
 	}
 	err = <-cliResult
 	if err != nil {
@@ -505,13 +513,20 @@ func TestVersion1Overflow(t *testing.T) {
 	}
 }
 
+// TestVersion1SlowLoris pins the deadline bound that replaces the old
+// single-read abort: a partial v1 line without a terminating CRLF no longer
+// fails because it spanned multiple reads, but a client that stalls before the
+// CRLF must still be released when the header-read timeout fires. The timeout
+// surfaces as ErrNoProxyProtocol (a timing outcome), not as a v1 format error.
 func TestVersion1SlowLoris(t *testing.T) {
+	const headerTimeout = 100 * time.Millisecond
+
 	done := make(chan struct{})
 	cliResult := make(chan error)
 	timeout := make(chan error)
 
-	l := listen(t)
-	go client(t, l.Addr().String(), fixtureTCP6V1Overflow, 0, false, 10*time.Second, done, cliResult)
+	l := listen(t, headerTimeout)
+	go client(t, l.Addr().String(), fixtureTCP6V1Overflow, 0, false, time.Second, done, cliResult)
 
 	c, err := l.Accept()
 	if err != nil {
@@ -526,10 +541,10 @@ func TestVersion1SlowLoris(t *testing.T) {
 
 	select {
 	case <-done:
-		t.Fatalf("net.Conn: reader still blocked after 10 seconds")
+		t.Fatalf("net.Conn: reader still blocked after the client gave up")
 	case err := <-timeout:
-		if err == nil {
-			t.Fatalf("net.Conn: no error reported for incomplete header")
+		if !errors.Is(err, ErrNoProxyProtocol) {
+			t.Fatalf("expected ErrNoProxyProtocol for a stalled partial header, got %v", err)
 		}
 	}
 	err = <-cliResult
@@ -538,13 +553,20 @@ func TestVersion1SlowLoris(t *testing.T) {
 	}
 }
 
+// TestVersion1SlowLorisOverflow combines both bounds: a stalled, delimiter-free
+// line that also exceeds the 107-byte limit is rejected promptly — either by
+// ErrVersion1HeaderTooLong once the limit is reached, or by the header timeout
+// if the bytes themselves arrive too slowly. Both outcomes are stable rejects
+// that release the goroutine instead of blocking on the client.
 func TestVersion1SlowLorisOverflow(t *testing.T) {
+	const headerTimeout = 500 * time.Millisecond
+
 	done := make(chan struct{})
 	cliResult := make(chan error)
 	timeout := make(chan error)
 
-	l := listen(t)
-	go client(t, l.Addr().String(), fixtureTCP6V1Overflow, 10240, false, 10*time.Second, done, cliResult)
+	l := listen(t, headerTimeout)
+	go client(t, l.Addr().String(), fixtureTCP6V1Overflow, 10240, false, 2*time.Second, done, cliResult)
 
 	c, err := l.Accept()
 	if err != nil {
@@ -559,10 +581,13 @@ func TestVersion1SlowLorisOverflow(t *testing.T) {
 
 	select {
 	case <-done:
-		t.Fatalf("net.Conn: reader still blocked after 10 seconds")
+		t.Fatalf("net.Conn: reader still blocked after the client gave up")
 	case err := <-timeout:
 		if err == nil {
 			t.Fatalf("net.Conn: no error reported for incomplete and overflowed header")
+		}
+		if !errors.Is(err, ErrVersion1HeaderTooLong) && !errors.Is(err, ErrNoProxyProtocol) {
+			t.Fatalf("expected header-too-long or timeout, got %v", err)
 		}
 	}
 	err = <-cliResult
@@ -611,4 +636,216 @@ func TestParseV1Boundaries(t *testing.T) {
 			t.Fatalf("expected ErrVersion1HeaderTooLong, got %v", err)
 		}
 	})
+}
+
+// chunkedReader feeds its data one chunk of at most maxChunk bytes per Read,
+// simulating a TCP stack that delivers the v1 line in arbitrarily small
+// segments.
+type chunkedReader struct {
+	data     []byte
+	pos      int
+	maxChunk int
+}
+
+func (r *chunkedReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, io.EOF
+	}
+	n := min(r.maxChunk, min(len(p), len(r.data)-r.pos))
+	copy(p, r.data[r.pos:r.pos+n])
+	r.pos += n
+	return n, nil
+}
+
+// headerReadTimeout is the net.Error returned when a read deadline fires.
+type headerReadTimeout struct{}
+
+func (headerReadTimeout) Error() string   { return "i/o timeout" }
+func (headerReadTimeout) Timeout() bool   { return true }
+func (headerReadTimeout) Temporary() bool { return true }
+
+// prefixTimeoutReader hands out its prefix once, then blocks with a read
+// timeout on every subsequent Read, modeling a slow client that stalls in the
+// middle of the v1 line before the CRLF.
+type prefixTimeoutReader struct {
+	prefix []byte
+	pos    int
+}
+
+func (r *prefixTimeoutReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.prefix) {
+		return 0, headerReadTimeout{}
+	}
+	n := copy(p, r.prefix[r.pos:])
+	r.pos += n
+	return n, nil
+}
+
+// TestParseV1ArbitraryFragmentation pins requirement 1 at the parser level:
+// the line may arrive in segments of any size (down to one byte per read), and
+// application bytes that arrive with the final segment must stay buffered past
+// the parsed header instead of being swallowed.
+func TestParseV1ArbitraryFragmentation(t *testing.T) {
+	lines := []string{fixtureTCP4V1, fixtureTCP6V1, fixtureUnknown, fixtureUnknownWithAddresses}
+	for _, line := range lines {
+		t.Run(fmt.Sprintf("line=%dbytes", len(line)), func(t *testing.T) {
+			for chunkSize := 1; chunkSize <= 5; chunkSize++ {
+				t.Run(fmt.Sprintf("chunksize=%d", chunkSize), func(t *testing.T) {
+					// A deliberately tiny buffer so bufio itself also has to
+					// refill; chunkedReader then limits each refill further.
+					reader := bufio.NewReaderSize(&chunkedReader{data: []byte(line), maxChunk: chunkSize}, 16)
+					header, err := Read(reader)
+					if err != nil {
+						t.Fatalf("Read failed: %v", err)
+					}
+					if header.Version != 1 {
+						t.Fatalf("expected a v1 header, got version %d", header.Version)
+					}
+					// The trailing "GET /" in the TCP4/TCP6 fixtures is application
+					// data and must remain readable; the other fixtures have none.
+					if rest := line[strings.Index(line, crlf)+len(crlf):]; rest != "" {
+						got, err := io.ReadAll(reader)
+						if err != nil {
+							t.Fatalf("reading buffered payload: %v", err)
+						}
+						if string(got) != rest {
+							t.Fatalf("payload not preserved: got %q, want %q (full line %q)", got, rest, line)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestParseV1TimeoutIsNotFormatError pins requirement 3 at the parser level:
+// when the read deadline fires while a partial line is buffered, the timeout
+// comes back as a net.Error rather than as a v1 parse/format error, so the
+// caller can tell "timed out" apart from "rejected".
+func TestParseV1TimeoutIsNotFormatError(t *testing.T) {
+	reader := bufio.NewReader(&prefixTimeoutReader{prefix: []byte("PROXY TCP4 1.2.3.4 5.6.7.8 80")})
+
+	_, err := Read(reader)
+	if err == nil {
+		t.Fatal("expected an error when the deadline fires mid-header")
+	}
+	var netErr net.Error
+	if !errors.As(err, &netErr) || !netErr.Timeout() {
+		t.Fatalf("expected a net.Error timeout, got %v (%T)", err, err)
+	}
+	if errors.Is(err, ErrCantReadVersion1Header) ||
+		errors.Is(err, ErrVersion1HeaderTooLong) ||
+		errors.Is(err, ErrLineMustEndWithCrlf) ||
+		errors.Is(err, ErrCantReadAddressFamilyAndProtocol) ||
+		errors.Is(err, ErrInvalidAddress) ||
+		errors.Is(err, ErrInvalidPortNumber) {
+		t.Fatalf("a timeout must not be classified as a v1 format error, got %v", err)
+	}
+}
+
+// TestParseV1TruncatedLineIsReadError pins that a clean EOF before the
+// terminating CRLF is a read/format failure (retry cannot complete the line on
+// a half-closed connection), not a timeout.
+func TestParseV1TruncatedLineIsReadError(t *testing.T) {
+	reader := newBufioReader([]byte("PROXY TCP4 1.2.3.4 5.6.7.8 80 443"))
+	_, err := Read(reader)
+	if !errors.Is(err, ErrCantReadVersion1Header) {
+		t.Fatalf("expected ErrCantReadVersion1Header for an EOF-truncated line, got %v", err)
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		t.Fatalf("EOF truncation must not classify as a timeout, got %v", err)
+	}
+}
+
+// TestParseV1UnknownProtocolKeepsRawToken pins requirement 4: an unrecognized
+// transport-protocol token is rejected without fabricating any connection
+// address, while the raw token is preserved in the error for diagnostics.
+func TestParseV1UnknownProtocolKeepsRawToken(t *testing.T) {
+	const raw = "PROXY FOO 1.2.3.4 5.6.7.8 80 443" + crlf
+	header, err := Read(newBufioReader([]byte(raw)))
+	if !errors.Is(err, ErrCantReadAddressFamilyAndProtocol) {
+		t.Fatalf("expected ErrCantReadAddressFamilyAndProtocol, got %v", err)
+	}
+	if !strings.Contains(err.Error(), `"FOO"`) {
+		t.Fatalf("expected the raw token %q to be retained in the error, got %v", "FOO", err)
+	}
+	if header != nil {
+		t.Fatalf("no header may be produced for an unknown protocol, got %+v", header)
+	}
+}
+
+// TestParseV1RejectedHeaderBytesNotTreatedAsPayload pins requirement 5 at the
+// reader level: bytes of a rejected line that had not yet been consumed stay
+// in the bufio.Reader as stream bytes — they are never reinterpreted as a
+// parsed header's addresses — and a payload trailing the line remains
+// reachable rather than being merged into a header.
+func TestParseV1RejectedHeaderBytesNotTreatedAsPayload(t *testing.T) {
+	for _, tc := range []struct {
+		desc        string
+		wire        string
+		expectedErr error
+	}{
+		{
+			desc:        "bare LF instead of CRLF",
+			wire:        "PROXY TCP4 1.2.3.4 5.6.7.8 80 443\nGET /",
+			expectedErr: ErrLineMustEndWithCrlf,
+		},
+		{
+			desc:        "unknown transport token",
+			wire:        "PROXY FOO 1.2.3.4 5.6.7.8 80 443" + crlf + "GET /",
+			expectedErr: ErrCantReadAddressFamilyAndProtocol,
+		},
+		{
+			desc:        "invalid port",
+			wire:        "PROXY TCP4 1.2.3.4 5.6.7.8 notaport 443" + crlf + "GET /",
+			expectedErr: ErrInvalidPortNumber,
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			reader := newBufioReader([]byte(tc.wire))
+			header, err := Read(reader)
+			if !errors.Is(err, tc.expectedErr) {
+				t.Fatalf("expected %v, got %v", tc.expectedErr, err)
+			}
+			if header != nil {
+				t.Fatalf("rejected line must not yield a header, got %+v", header)
+			}
+			// The trailing application bytes must still be ordinary stream bytes
+			// and must never have been turned into proxy addresses.
+			rest, err := io.ReadAll(reader)
+			if err != nil {
+				t.Fatalf("reading remaining stream bytes: %v", err)
+			}
+			if !strings.HasSuffix(string(rest), "GET /") {
+				t.Fatalf("payload not retained as plain stream data: got %q", string(rest))
+			}
+		})
+	}
+}
+
+// TestParseV1TooLongHeaderKeepsTrailingPayload exercises the 107-byte bound
+// with a payload in the same stream: the line is rejected deterministically
+// (never parsed), and the payload stays buffered rather than being consumed as
+// part of the header.
+func TestParseV1TooLongHeaderKeepsTrailingPayload(t *testing.T) {
+	line := "PROXY UNKNOWN " + strings.Repeat("x", maxV1HeaderSize-len("PROXY UNKNOWN ")) // exactly 107 bytes, no CRLF
+	if len(line) != maxV1HeaderSize {
+		t.Fatalf("fixture error: line is %d bytes, want %d", len(line), maxV1HeaderSize)
+	}
+	reader := newBufioReader([]byte(line + "GET /"))
+	header, err := Read(reader)
+	if !errors.Is(err, ErrVersion1HeaderTooLong) {
+		t.Fatalf("expected ErrVersion1HeaderTooLong, got %v", err)
+	}
+	if header != nil {
+		t.Fatalf("oversized line must not yield a header, got %+v", header)
+	}
+	rest, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("reading remaining stream bytes: %v", err)
+	}
+	if string(rest) != "GET /" {
+		t.Fatalf("payload must stay buffered after an over-long header, got %q", string(rest))
+	}
 }

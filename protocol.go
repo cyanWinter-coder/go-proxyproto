@@ -78,8 +78,9 @@ type Listener struct {
 	ReadHeaderTimeout time.Duration
 	// ReadBufferSize is the read buffer size for accepted connections. When > 0,
 	// each accepted connection uses this size for proxy header detection; 0 means default.
-	// See the sizing note on WithBufferSize: values below 107 bytes break v1
-	// header parsing.
+	// See the sizing note on WithBufferSize: v1 lines longer than the buffer are
+	// read across refills, so any size works; only the bytes buffered past the
+	// header shrink with the buffer.
 	ReadBufferSize int
 }
 
@@ -130,11 +131,12 @@ func SetReadHeaderTimeout(t time.Duration) func(*Conn) {
 // effectively 16 due to bufio's minimum. The default is tuned for typical proxy
 // protocol header lengths.
 //
-// The buffer must be able to hold an entire v1 header line (up to 107 bytes):
-// v1 parsing requires the line to be available without refilling the buffer
-// (the slow-loris defense), so a smaller buffer rejects every v1 connection
-// with ErrCantReadVersion1Header even from well-behaved senders. v2 parsing
-// refills freely and works with any size.
+// The buffer no longer needs to hold an entire v1 header line (up to 107 bytes):
+// v1 parsing refills the buffer as many times as the line requires and tolerates
+// arbitrary TCP segmentation, so lines longer than the buffer are parsed just
+// like v2 frames. A small buffer only limits how many payload bytes arriving in
+// the same segments as the header can be cached past it; those bytes are still
+// read correctly, just with an extra refill.
 func WithBufferSize(length int) func(*Conn) {
 	return func(c *Conn) {
 		if length <= 0 {
@@ -455,7 +457,12 @@ func (p *Conn) readHeader() error {
 		// closes. Only surface a restore failure when the read produced neither
 		// a header nor an error of its own.
 		restoreErr := p.conn.SetReadDeadline(t.(time.Time))
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		// errors.As unwraps the parse/transport wrappers: a deadline firing
+		// mid-header reaches us as e.g. ErrCantReadVersion1Header wrapping a
+		// net.Error, and must still classify as "no header in time" rather than
+		// as a malformed header.
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
 			err = ErrNoProxyProtocol
 		} else if err == nil && header == nil {
 			err = restoreErr

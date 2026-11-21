@@ -25,6 +25,11 @@ const (
 	testUnixSocketName = "socket"
 	testUnixSrcName    = "src"
 	testUnixDstName    = "dst"
+
+	// Reusable rendered addresses/payloads for header and connection tests.
+	testHeaderV4SourceAddr = "10.1.1.1:1000"
+	testHeaderSampleAddr   = "1.2.3.4:80"
+	testPingPayload        = "ping"
 )
 
 var (
@@ -173,8 +178,36 @@ func TestReadHeaderTimeoutNoHeaderPreservesData(t *testing.T) {
 	}
 }
 
+// TestReadHeaderTimeoutMidHeaderClassifiesAsNoHeader pins the distinction
+// between a timeout and a malformed header at the ReadHeaderTimeout boundary:
+// when the deadline fires after part of a v1 line has arrived (so the signature
+// is known and parseVersion1 is already consuming bytes), the wrapped timeout
+// must still classify as ErrNoProxyProtocol, not as a v1 parse error.
+func TestReadHeaderTimeoutMidHeaderClassifiesAsNoHeader(t *testing.T) {
+	client, server := net.Pipe()
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = server.Close()
+	})
+
+	go func() {
+		// Signature plus a partial body, deliberately no terminating CRLF.
+		_, _ = client.Write([]byte("PROXY TCP4 1.2.3.4 5.6.7.8 80"))
+	}()
+
+	reader := bufio.NewReader(server)
+	h, err := ReadHeaderTimeout(server, reader, 60*time.Millisecond)
+	if err != ErrNoProxyProtocol {
+		t.Fatalf("expected ErrNoProxyProtocol for a mid-header timeout, got %v", err)
+	}
+	if h != nil {
+		t.Fatalf("expected nil header on timeout, got %+v", h)
+	}
+}
+
+// TestReadHeaderTimeoutZeroTimeoutReadsWithoutDeadline pins that a timeout <= 0
+// skips the deadline entirely and still reads a header.
 func TestReadHeaderTimeoutZeroTimeoutReadsWithoutDeadline(t *testing.T) {
-	// A timeout <= 0 must skip the deadline entirely and still read a header.
 	client, server := net.Pipe()
 	t.Cleanup(func() {
 		_ = client.Close()
@@ -191,7 +224,7 @@ func TestReadHeaderTimeoutZeroTimeoutReadsWithoutDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if h == nil || h.SourceAddr.String() != "10.1.1.1:1000" {
+	if h == nil || h.SourceAddr.String() != testHeaderV4SourceAddr {
 		t.Fatalf("unexpected header: %+v", h)
 	}
 }
