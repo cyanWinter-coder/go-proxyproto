@@ -66,6 +66,13 @@ type Header struct {
 	SourceAddr        net.Addr
 	DestinationAddr   net.Addr
 	rawTLVs           []byte
+	// parsedTLVs caches the result of splitting rawTLVs. tlvParsed is set once
+	// parseVersion2, SetTLVs or a lazy TLVs call has split the vector, so
+	// repeated TLVs calls never re-split — including the empty-vector case,
+	// where parsedTLVs stays nil. tlvErr holds any framing error found.
+	parsedTLVs []TLV
+	tlvParsed  bool
+	tlvErr     error
 }
 
 // HeaderProxyFromAddrs creates a new PROXY header from a source and a
@@ -250,18 +257,55 @@ func (header *Header) Format() ([]byte, error) {
 }
 
 // TLVs returns the TLVs stored into this header, if they exist.  TLVs are optional for v2 of the protocol.
+//
+// For headers parsed with Read, the vector was already validated against the
+// declared v2 section length while the header was being read; a framing error
+// therefore surfaces from Read instead of this method. TLVs are returned in
+// wire order, including every occurrence of a repeated type, so callers never
+// observe a later value silently overwriting an earlier one.
 func (header *Header) TLVs() ([]TLV, error) {
-	return SplitTLVs(header.rawTLVs)
+	// parseVersion2, SetTLVs and earlier lazy calls leave their result here;
+	// only a hand-built header that never parsed its rawTLVs takes the split
+	// path below.
+	if header.tlvParsed {
+		return header.parsedTLVs, header.tlvErr
+	}
+	tlvs, err := SplitTLVs(header.rawTLVs)
+	header.parsedTLVs = tlvs
+	header.tlvErr = err
+	header.tlvParsed = true
+	return tlvs, err
+}
+
+// TLVsByType returns every TLV of the given type in wire order. Duplicate
+// types are all returned rather than collapsed, and the error is the same
+// framing error TLVs would return.
+func (header *Header) TLVsByType(typ PP2Type) ([]TLV, error) {
+	tlvs, err := header.TLVs()
+	if err != nil {
+		return nil, err
+	}
+	return FindTLVs(tlvs, typ), nil
 }
 
 // SetTLVs sets the TLVs stored in this header. This method replaces any
-// previous TLV.
+// previous TLV. The new vector is validated through the same framing rules as
+// wire parsing; on error the header is left untouched rather than holding an
+// unparseable section.
 func (header *Header) SetTLVs(tlvs []TLV) error {
 	raw, err := JoinTLVs(tlvs)
 	if err != nil {
 		return err
 	}
+	parsed, parseErr := SplitTLVs(raw)
+	if parseErr != nil {
+		return parseErr
+	}
 	header.rawTLVs = raw
+	// Refresh the cache so TLVs serves the new vector without re-splitting.
+	header.parsedTLVs = parsed
+	header.tlvErr = nil
+	header.tlvParsed = true
 	return nil
 }
 

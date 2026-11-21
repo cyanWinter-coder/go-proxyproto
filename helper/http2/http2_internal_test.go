@@ -224,9 +224,10 @@ func TestServeConnRejectsUnsupportedProxyALPN(t *testing.T) {
 }
 
 func TestServeConnReturnsMalformedProxyTLVError(t *testing.T) {
-	// Header parsing deliberately stores raw TLV bytes; the HTTP/2 helper only
-	// validates them when it looks for ALPN. This verifies that malformed TLVs are
-	// surfaced and the connection is closed in that delayed-validation path.
+	// TLV framing is now validated while the v2 header is read, so a malformed
+	// TLV makes ProxyHeader() return nil and ReadHeaderError carry the framing
+	// error. This verifies serveConn surfaces that error and closes the
+	// connection instead of falling through to the HTTP/1 fallback.
 	srv := &Server{
 		h1: &http.Server{
 			ReadHeaderTimeout: time.Second,
@@ -250,8 +251,9 @@ func TestServeConnReturnsMalformedProxyTLVError(t *testing.T) {
 
 func malformedV2LocalTLV() []byte {
 	// Construct a syntactically valid v2 LOCAL header whose payload is one byte of
-	// raw TLV data. Header parsing accepts it, but Header.TLVs later reports
-	// ErrTruncatedTLV because one byte cannot contain a complete TLV tuple.
+	// raw TLV data. The declared length covers the byte, but strict TLV framing
+	// rejects it while the header is read because one byte cannot contain a
+	// complete TLV tuple.
 	header := append([]byte{}, proxyproto.SIGV2...)
 	header = append(header, byte(proxyproto.LOCAL), byte(proxyproto.UNSPEC))
 	header = append(header, 0, 1)

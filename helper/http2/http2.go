@@ -188,6 +188,15 @@ func (srv *Server) serveConn(baseCtx context.Context, conn net.Conn) error {
 		}
 		proto = conn.ConnectionState().NegotiatedProtocol
 	case *proxyproto.Conn:
+		// A malformed header (e.g. invalid TLV framing) now fails while the
+		// header is read, so check the read error before consulting the
+		// possibly-nil header.
+		if err := conn.ReadHeaderError(); err != nil {
+			if closeErr := conn.Close(); closeErr != nil {
+				srv.errorLog().Printf("failed to close connection: %v", closeErr)
+			}
+			return err
+		}
 		if proxyHeader := conn.ProxyHeader(); proxyHeader != nil {
 			tlvs, err := proxyHeader.TLVs()
 			if err != nil {

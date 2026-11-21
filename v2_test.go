@@ -3,7 +3,6 @@ package proxyproto
 import (
 	"bufio"
 	"bytes"
-	iorand "crypto/rand"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -44,13 +43,20 @@ var (
 	addressesIPv6 = append(v6ip.To16(), v6ip.To16()...)
 	ports         = append(portBytes, portBytes...)
 
+	// NOOP padding vectors used to pad headers past the fixed address blocks.
+	// Strict TLV framing rejects raw zero bytes, so padding is emitted as
+	// PP2_TYPE_NOOP records (3 bytes each); the chosen padded lengths are
+	// multiples of 3 to keep the framing exact.
+	padTLVsV4 = noopPadding(int(lengthPadded) - int(lengthV4))
+	padTLVsV6 = noopPadding(int(lengthPadded) - int(lengthV6))
+
 	// Fixtures to use in tests.
 	fixtureIPv4Address  = append(addressesIPv4, ports...)
 	fixtureIPv4V2       = append(lengthV4Bytes, fixtureIPv4Address...)
-	fixtureIPv4V2Padded = append(append(lengthPaddedBytes, fixtureIPv4Address...), make([]byte, lengthPadded-lengthV4)...)
+	fixtureIPv4V2Padded = append(append(lengthPaddedBytes, fixtureIPv4Address...), padTLVsV4...)
 	fixtureIPv6Address  = append(addressesIPv6, ports...)
 	fixtureIPv6V2       = append(lengthV6Bytes, fixtureIPv6Address...)
-	fixtureIPv6V2Padded = append(append(lengthPaddedBytes, fixtureIPv6Address...), make([]byte, lengthPadded-lengthV6)...)
+	fixtureIPv6V2Padded = append(append(lengthPaddedBytes, fixtureIPv6Address...), padTLVsV6...)
 	fixtureUnixAddress  = append(unixBytes, unixBytes...)
 	fixtureUnixV2       = append(lengthUnixBytes, fixtureUnixAddress...)
 
@@ -60,22 +66,45 @@ var (
 		binary.BigEndian.PutUint16(a, lengthUnix+4)
 		return a
 	}()
-	fixtureUnixV2Padded = append(append(lengthUnixPaddedBytes, fixtureUnixAddress...), make([]byte, 4)...)
-	fixtureTLV          = func() []byte {
-		tlv := make([]byte, 100)
-		_, _ = iorand.Read(tlv)
-		return tlv
-	}()
+	fixtureUnixV2Padded = append(append(lengthUnixPaddedBytes, fixtureUnixAddress...), unixPaddedTLVs...)
+
+	// Well-formed TLV vectors: strict parsing rejects random/zero padding as a
+	// framing error, so fixtures must carry real Type-Length-Value records.
+	// fixtureTLV mixes an unknown custom type (raw bytes must survive), a known
+	// type (ALPN) and NOOP padding whose value is intentionally dropped.
+	fixtureTLV = mustJoinTLVs(
+		TLV{Type: PP2_TYPE_MIN_CUSTOM + 1, Value: []byte{0xDE, 0xAD, 0xBE, 0xEF}},
+		TLV{Type: PP2_TYPE_ALPN, Value: []byte{'h', '2'}},
+		TLV{Type: PP2_TYPE_NOOP, Value: []byte{0x00, 0x00}},
+	)
 	fixtureIPv4V2TLV = fixtureWithTLV(lengthV4Bytes, fixtureIPv4Address, fixtureTLV)
 	fixtureIPv6V2TLV = fixtureWithTLV(lengthV6Bytes, fixtureIPv6Address, fixtureTLV)
 	fixtureUnixV2TLV = fixtureWithTLV(lengthUnixBytes, fixtureUnixAddress, fixtureTLV)
 	fixtureUnspecTLV = fixtureWithTLV(lengthUnspecBytes, []byte{}, fixtureTLV)
 
-	fixtureMediumTLV   = make([]byte, 2048)
+	// A single large but well-formed TLV, exercising headers near the
+	// MaxV2HeaderSize/MaxTLVLength limits without any framing error.
+	fixtureMediumTLV   = mustJoinTLVs(TLV{Type: PP2_TYPE_UNIQUE_ID, Value: make([]byte, 2048)})
 	fixtureV2MediumTLV = fixtureWithTLV(lengthV4Bytes, fixtureIPv4Address, fixtureMediumTLV)
 
 	fixtureTooLargeTLV   = make([]byte, 10*1024)
 	fixtureV2TooLargeTLV = fixtureWithTLV(lengthV4Bytes, fixtureIPv4Address, fixtureTooLargeTLV)
+
+	// noopPadding renders n bytes of PP2_TYPE_NOOP records (3 bytes each) for
+	// the padded-header tests.
+	noopPadding = func(n int) []byte {
+		if n%3 != 0 {
+			panic("noopPadding only supports multiples of 3")
+		}
+		raw := make([]byte, n)
+		for i := 0; i < n; i += 3 {
+			raw[i] = byte(PP2_TYPE_NOOP)
+		}
+		return raw
+	}
+	// Trailing block for a Unix header whose declared length is 4 bytes over
+	// the fixed address block: one NOOP TLV plus one leftover NOOP byte pair.
+	unixPaddedTLVs = append([]byte{byte(PP2_TYPE_NOOP), 0x00, 0x01}, byte(PP2_TYPE_NOOP))
 
 	// Arbitrary bytes following proxy bytes.
 	arbitraryTailBytes = []byte{'\x99', '\x97', '\x98'}
@@ -232,7 +261,12 @@ func TestParseV2Invalid(t *testing.T) {
 // PP2_SUBTYPE_SSL_CLIENT_CERT TLV carrying a certificate chain).
 func TestParseV2MaxHeaderSizeBoundary(t *testing.T) {
 	parse := func(payloadLen int) error {
-		raw := v2Header(byte(PROXY), byte(TCPv4), make([]byte, payloadLen))
+		// A well-formed TCPv4 frame of the exact payload length: fixed address
+		// block plus a TLV section made entirely of NOOP padding (each value
+		// stays tiny, so MaxTLVLength cannot interfere with the header limit
+		// under test).
+		payload := append(bytes.Clone(fixtureIPv4Address), validTLVSection(payloadLen-int(lengthV4))...)
+		raw := v2Header(byte(PROXY), byte(TCPv4), payload)
 		_, err := Read(bufio.NewReader(bytes.NewReader(raw)))
 		return err
 	}
@@ -522,7 +556,7 @@ var validParseV2PaddedTests = []struct {
 			TransportProtocol: TCPv4,
 			SourceAddr:        v4addr,
 			DestinationAddr:   v4addr,
-			rawTLVs:           make([]byte, lengthPadded-lengthV4),
+			rawTLVs:           noopPadding(int(lengthPadded) - int(lengthV4)),
 		},
 	},
 	{
@@ -534,7 +568,7 @@ var validParseV2PaddedTests = []struct {
 			TransportProtocol: TCPv6,
 			SourceAddr:        v6addr,
 			DestinationAddr:   v6addr,
-			rawTLVs:           make([]byte, lengthPadded-lengthV6),
+			rawTLVs:           noopPadding(int(lengthPadded) - int(lengthV6)),
 		},
 	},
 	{
@@ -546,7 +580,7 @@ var validParseV2PaddedTests = []struct {
 			TransportProtocol: UDPv4,
 			SourceAddr:        v4addr,
 			DestinationAddr:   v4addr,
-			rawTLVs:           make([]byte, lengthPadded-lengthV4),
+			rawTLVs:           noopPadding(int(lengthPadded) - int(lengthV4)),
 		},
 	},
 	{
@@ -558,7 +592,7 @@ var validParseV2PaddedTests = []struct {
 			TransportProtocol: UnixStream,
 			SourceAddr:        unixStreamAddr,
 			DestinationAddr:   unixStreamAddr,
-			rawTLVs:           make([]byte, 4),
+			rawTLVs:           unixPaddedTLVs,
 		},
 	},
 	{
@@ -570,7 +604,7 @@ var validParseV2PaddedTests = []struct {
 			TransportProtocol: UDPv6,
 			SourceAddr:        v6addr,
 			DestinationAddr:   v6addr,
-			rawTLVs:           make([]byte, lengthPadded-lengthV6),
+			rawTLVs:           noopPadding(int(lengthPadded) - int(lengthV6)),
 		},
 	},
 }
@@ -710,7 +744,6 @@ func TestV2TLVFormatTooLargeTLV(t *testing.T) {
 				t.Fatalf("missing or expected error when formatting too-large TLV %#v", err)
 			}
 		})
-
 	}
 }
 
@@ -725,6 +758,34 @@ func fixtureWithTLV(cur []byte, addr []byte, tlv []byte) []byte {
 	}
 
 	return append(append(tlen, addr...), tlv...)
+}
+
+// mustJoinTLVs builds a raw TLV vector for fixtures, panicking on error.
+func mustJoinTLVs(tlvs ...TLV) []byte {
+	raw, err := JoinTLVs(tlvs)
+	if err != nil {
+		panic(err)
+	}
+	return raw
+}
+
+// validTLVSection builds a parseable PP2_TYPE_NOOP TLV vector of exactly n
+// bytes, used where a test needs a header payload of a precise size without
+// any TLV framing error.
+func validTLVSection(n int) []byte {
+	records, remainder := n/3, n%3
+	raw := make([]byte, 0, n)
+	for range records - 1 {
+		raw = append(raw, byte(PP2_TYPE_NOOP), 0x00, 0x00)
+	}
+	if records >= 1 {
+		length := make([]byte, 2)
+		binary.BigEndian.PutUint16(length, uint16(remainder))
+		raw = append(raw, byte(PP2_TYPE_NOOP))
+		raw = append(raw, length...)
+		raw = append(raw, make([]byte, remainder)...)
+	}
+	return raw
 }
 
 func Test_parseUnixName(t *testing.T) {

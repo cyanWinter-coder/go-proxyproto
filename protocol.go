@@ -316,11 +316,24 @@ func (p *Conn) Close() error {
 }
 
 // ProxyHeader returns the proxy protocol header, if any. If an error occurs
-// while reading the proxy header, nil is returned.
+// while reading the proxy header, nil is returned; use ReadHeaderError to
+// retrieve that error.
 func (p *Conn) ProxyHeader() *Header {
 	// Ensure header processing runs at most once.
 	_ = p.ensureHeaderProcessed()
 	return p.header
+}
+
+// ReadHeaderError returns the error encountered while detecting and reading
+// the PROXY protocol header, or nil when header processing succeeded (or has
+// not run yet). It lets callers distinguish a connection that genuinely
+// carries no header from one whose header was rejected — for example a v2
+// header whose TLV framing fails validation, which is now rejected while the
+// header is read rather than deferred to Header.TLVs.
+func (p *Conn) ReadHeaderError() error {
+	// Ensure header processing runs at most once.
+	_ = p.ensureHeaderProcessed()
+	return p.readErr
 }
 
 // LocalAddr returns the address of the server if the proxy

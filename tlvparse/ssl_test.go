@@ -288,7 +288,9 @@ func TestSSLRejectsMalformedTLVs(t *testing.T) {
 		{
 			name: "empty version",
 			tlv:  sslTLV(PP2_BITFIELD_CLIENT_SSL, mustJoinTLVs(t, proxyproto.TLV{Type: proxyproto.PP2_SUBTYPE_SSL_VERSION})),
-			want: proxyproto.ErrMalformedTLV,
+			// A zero-length non-NOOP TLV is rejected at framing time, before
+			// SSL's own non-empty ASCII check is reached.
+			want: proxyproto.ErrInvalidTLV,
 		},
 		{
 			name: "non ASCII version",
@@ -304,7 +306,7 @@ func TestSSLRejectsMalformedTLVs(t *testing.T) {
 				validVersion,
 				proxyproto.TLV{Type: proxyproto.PP2_SUBTYPE_SSL_CN},
 			)),
-			want: proxyproto.ErrMalformedTLV,
+			want: proxyproto.ErrInvalidTLV,
 		},
 		{
 			name: "invalid UTF-8 common name",
@@ -320,7 +322,7 @@ func TestSSLRejectsMalformedTLVs(t *testing.T) {
 				validVersion,
 				proxyproto.TLV{Type: proxyproto.PP2_SUBTYPE_SSL_CIPHER},
 			)),
-			want: proxyproto.ErrMalformedTLV,
+			want: proxyproto.ErrInvalidTLV,
 		},
 		{
 			name: "non ASCII cipher",

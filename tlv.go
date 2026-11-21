@@ -40,13 +40,35 @@ const (
 	PP2_TYPE_MAX_FUTURE     PP2Type = 0xFF
 )
 
+// MaxTLVLength is the maximum accepted length field of a single v2 TLV value.
+//
+// The on-wire field is 16 bits and allows up to 65535, but a TLV that large
+// inside a header already bounded by MaxV2HeaderSize can only be a framing
+// error (a miscomputed length that would consume subsequent TLVs, or bytes
+// belonging to the next request). Rejecting it as a protocol error keeps such
+// a frame from being accepted and corrupting the following request, while the
+// default stays above the largest real-world TLV
+// (PP2_SUBTYPE_SSL_CLIENT_CERT, typically 1..2 KiB).
+//
+// Like MaxV2HeaderSize, this is a package-level variable so deployments can
+// raise it. Set it at program init; it must not be modified concurrently with
+// parsing.
+var MaxTLVLength uint16 = 4096
+
 var (
-	// ErrTruncatedTLV indicates a TLV was truncated.
+	// ErrTruncatedTLV indicates a TLV was truncated: its header is incomplete
+	// or its declared length runs past the end of the TLV vector (which, for a
+	// header parsed off the wire, is itself bounded by the v2 length field).
 	ErrTruncatedTLV = errors.New("proxyproto: truncated TLV")
 	// ErrMalformedTLV indicates a TLV has malformed data.
 	ErrMalformedTLV = errors.New("proxyproto: malformed TLV Value")
 	// ErrIncompatibleTLV indicates a TLV is of an unexpected type.
 	ErrIncompatibleTLV = errors.New("proxyproto: incompatible TLV type")
+	// ErrInvalidTLV indicates a TLV whose framing is invalid even though every
+	// byte it claims is present: a non-NOOP TLV with a zero length, or a
+	// declared length above MaxTLVLength. PP2_TYPE_NOOP padding may legally
+	// carry an empty value and is exempt.
+	ErrInvalidTLV = errors.New("proxyproto: invalid TLV")
 )
 
 // PP2Type is the proxy protocol v2 type.
@@ -58,21 +80,51 @@ type TLV struct {
 	Value []byte
 }
 
-// SplitTLVs splits the Type-Length-Value vector, returns the vector or an error.
+// SplitTLVs splits the Type-Length-Value vector, returns the vector or an
+// error.
+//
+// raw must be exactly the TLV section of a v2 header: parseVersion2 first
+// delimits the whole v2 payload (address block plus TLVs) by the header's
+// declared 16-bit length, so every TLV is checked against the same boundary
+// the sender declared rather than against whatever bytes follow on the
+// connection. The failure modes are:
+//
+//   - ErrTruncatedTLV: fewer than three bytes remain for a TLV header, or the
+//     declared value length extends past the end of raw. A TLV that claims
+//     bytes beyond the section cannot be framed safely and must not be read
+//     into the next request's data.
+//   - ErrInvalidTLV: a non-NOOP TLV declares a zero length, or a length above
+//     MaxTLVLength. NOOP is padding and may be empty.
+//
+// Unknown TLV types are never rejected: their raw value bytes are preserved
+// verbatim for upper layers. Every TLV, including duplicates of a known type,
+// is appended in wire order; callers see all occurrences instead of the last
+// one silently overwriting earlier ones.
 func SplitTLVs(raw []byte) ([]TLV, error) {
 	var tlvs []TLV
 	for i := 0; i < len(raw); {
+		// A TLV needs its one-byte type and two-byte length before any value.
+		if len(raw)-i < 3 {
+			return nil, ErrTruncatedTLV
+		}
 		tlv := TLV{
 			Type: PP2Type(raw[i]),
 		}
-		if len(raw)-i <= 2 {
+		tlvLen := int(binary.BigEndian.Uint16(raw[i+1 : i+3]))
+		// The value must stay inside the section the header declared; otherwise
+		// framing the TLV would consume bytes of the next request.
+		if tlvLen > len(raw)-(i+3) {
 			return nil, ErrTruncatedTLV
 		}
-		tlvLen := int(binary.BigEndian.Uint16(raw[i+1 : i+3])) // Max length = 65K
+		if tlvLen > int(MaxTLVLength) {
+			return nil, fmt.Errorf("%w: type %#x length %d exceeds %d", ErrInvalidTLV, byte(tlv.Type), tlvLen, MaxTLVLength)
+		}
+		// NOOP padding may legitimately carry no value; every other type with
+		// a zero length is an unambiguously malformed frame.
+		if tlvLen == 0 && tlv.Type != PP2_TYPE_NOOP {
+			return nil, fmt.Errorf("%w: type %#x has zero length", ErrInvalidTLV, byte(tlv.Type))
+		}
 		i += 3
-		if i+tlvLen > len(raw) {
-			return nil, ErrTruncatedTLV
-		}
 		// Ignore no-op padding
 		if tlv.Type != PP2_TYPE_NOOP {
 			tlv.Value = make([]byte, tlvLen)
@@ -82,6 +134,20 @@ func SplitTLVs(raw []byte) ([]TLV, error) {
 		tlvs = append(tlvs, tlv)
 	}
 	return tlvs, nil
+}
+
+// FindTLVs returns every TLV of the given type, in wire order. A header that
+// repeats a known type exposes all occurrences rather than only the last one;
+// callers that want a single value can take the first element. Unknown types
+// are included like any other, with their raw value bytes preserved.
+func FindTLVs(tlvs []TLV, typ PP2Type) []TLV {
+	var found []TLV
+	for _, tlv := range tlvs {
+		if tlv.Type == typ {
+			found = append(found, tlv)
+		}
+	}
+	return found
 }
 
 // JoinTLVs joins multiple Type-Length-Value records.

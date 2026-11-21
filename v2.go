@@ -24,7 +24,9 @@ import (
 //
 // Like DefaultReadHeaderTimeout, this is a package-level variable to keep it
 // easy to override. Set it at program init; it must not be modified
-// concurrently with parsing.
+// concurrently with parsing. Note that a single TLV value is additionally
+// bounded by MaxTLVLength, which must be raised as well when accepting
+// headers whose TLV section contains large records.
 var MaxV2HeaderSize uint16 = 4096
 
 var (
@@ -212,7 +214,10 @@ func parseVersion2(reader *bufio.Reader) (header *Header, err error) {
 		}
 	}
 
-	// Copy bytes for optional Type-Length-Value vector
+	// Copy bytes for optional Type-Length-Value vector. At this point the read
+	// is bounded by the header's declared length (payloadReader above), so
+	// rawTLVs contains exactly the bytes inside the v2 section after the
+	// address block — never bytes of the following request.
 	header.rawTLVs = make([]byte, payloadReader.N) // Allocate minimum size slice
 	if _, err = io.ReadFull(payloadReader, header.rawTLVs); err != nil && err != io.EOF {
 		return nil, err
@@ -220,6 +225,18 @@ func parseVersion2(reader *bufio.Reader) (header *Header, err error) {
 
 	if payloadReader.N != 0 {
 		return nil, ErrInvalidLength
+	}
+
+	// Parse the TLV vector now, while the header is being read, rather than
+	// deferring to the first TLVs() call: a zero-length non-NOOP TLV, a value
+	// that overruns the declared section, or a length above MaxTLVLength is a
+	// protocol error that must not leave the caller with an accepted header
+	// whose trailing bytes desynchronize subsequent request parsing. The parsed
+	// vector is cached on the header and reused by TLVs/FindTLVs.
+	header.parsedTLVs, header.tlvErr = SplitTLVs(header.rawTLVs)
+	header.tlvParsed = true
+	if header.tlvErr != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidTLV, header.tlvErr)
 	}
 
 	return header, nil
