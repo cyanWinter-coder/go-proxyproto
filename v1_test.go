@@ -45,9 +45,11 @@ var invalidParseV1Tests = []struct {
 		expectedError: ErrNoProxyProtocol,
 	},
 	{
-		desc:          "prox",
+		desc: "prox",
+		// A v1 signature prefix cut short by a clean EOF is an incomplete PROXY
+		// header, not a headerless stream (unified-header rule 1).
 		reader:        newBufioReader([]byte("PROX")),
-		expectedError: ErrNoProxyProtocol,
+		expectedError: ErrIncompleteProxyProtocolSignature,
 	},
 	{
 		desc:          "proxy lf",

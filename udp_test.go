@@ -101,6 +101,23 @@ func TestParseUDPDatagram(t *testing.T) {
 			t.Fatal("truncated datagram must be rejected")
 		}
 	})
+
+	t.Run("truncated signature is not guessed as raw payload", func(t *testing.T) {
+		// A datagram that opens with a signature prefix but ends before the
+		// signature completes is an incomplete PROXY header, not headerless
+		// application traffic (unified-header rule 1). It must fail with the
+		// truncation error rather than ErrNoProxyProtocol, and never be returned
+		// as a payload.
+		for _, datagram := range [][]byte{SIGV1[:3], SIGV2[:6], SIGV2[:1]} {
+			h, rest, err := ParseUDPDatagram(datagram)
+			if !errors.Is(err, ErrIncompleteProxyProtocolSignature) {
+				t.Fatalf("datagram %x: expected ErrIncompleteProxyProtocolSignature, got %v", datagram, err)
+			}
+			if h != nil || rest != nil {
+				t.Fatalf("truncated datagram must not yield a header or payload: h=%v rest=%v", h, rest)
+			}
+		}
+	})
 }
 
 // TestFormatUDPDatagramError pins that a header that cannot Format surfaces

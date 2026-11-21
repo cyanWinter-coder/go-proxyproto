@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"time"
@@ -42,6 +43,13 @@ var (
 	ErrCantResolveDestinationUnixAddress = errors.New("proxyproto: can't resolve destination Unix address")
 	// ErrNoProxyProtocol indicates a proxy protocol signature is not present.
 	ErrNoProxyProtocol = errors.New("proxyproto: proxy protocol signature not present")
+	// ErrIncompleteProxyProtocolSignature indicates the stream began with a
+	// prefix of a PROXY protocol signature but ended (clean EOF) before the
+	// full signature arrived. It is a truncated PROXY header, never a
+	// headerless stream: a receiver must not treat such a connection as raw
+	// traffic, because a peer that deliberately opens with the signature bytes
+	// is unambiguously speaking the PROXY protocol.
+	ErrIncompleteProxyProtocolSignature = errors.New("proxyproto: incomplete proxy protocol signature")
 	// ErrUnknownProxyProtocolVersion indicates an unknown proxy protocol version.
 	ErrUnknownProxyProtocolVersion = errors.New("proxyproto: unknown proxy protocol version")
 	// ErrUnsupportedProtocolVersionAndCommand indicates an unsupported protocol version and command.
@@ -271,6 +279,12 @@ func (header *Header) SetTLVs(tlvs []TLV) error {
 // If proxy protocol header signature is not present, the reader buffer remains untouched
 // and is safe for reading outside of this code.
 //
+// If the stream begins with a prefix of a PROXY protocol signature but ends
+// before the full signature is available, Read returns
+// ErrIncompleteProxyProtocolSignature (possibly wrapping io.ErrUnexpectedEOF):
+// a truncated signature is an incomplete PROXY header, not a headerless
+// stream, so it is never reported as ErrNoProxyProtocol.
+//
 // If proxy protocol header signature is present but an error is raised while processing
 // the remaining header, assume the reader buffer to be in a corrupt state.
 // Also, this operation will block until enough bytes are available for peeking.
@@ -284,31 +298,78 @@ func Read(reader *bufio.Reader) (*Header, error) {
 		return nil, err
 	}
 
-	if bytes.Equal(b1[:1], SIGV1[:1]) || bytes.Equal(b1[:1], SIGV2[:1]) {
-		signature, err := reader.Peek(5)
-		if err != nil {
-			if err == io.EOF {
-				return nil, ErrNoProxyProtocol
-			}
-			return nil, err
-		}
-		if bytes.Equal(signature[:5], SIGV1) {
-			return parseVersion1(reader)
-		}
-
-		signature, err = reader.Peek(12)
-		if err != nil {
-			if err == io.EOF {
-				return nil, ErrNoProxyProtocol
-			}
-			return nil, err
-		}
-		if bytes.Equal(signature[:12], SIGV2) {
-			return parseVersion2(reader)
-		}
+	if !bytes.Equal(b1[:1], SIGV1[:1]) && !bytes.Equal(b1[:1], SIGV2[:1]) {
+		// First byte matches neither signature: this is ordinary traffic, not a
+		// truncated PROXY header.
+		return nil, ErrNoProxyProtocol
 	}
 
+	// The first byte is shared by both signatures, so a 5-byte peek is the
+	// minimum safe prefix that can tell v1 apart from v2 (and from unrelated
+	// traffic that merely shares the first byte).
+	signature, err := peekPrefix(reader, 5)
+	if err != nil {
+		return nil, err
+	}
+	if bytes.Equal(signature[:5], SIGV1) {
+		return parseVersion1(reader)
+	}
+
+	// Not the v1 signature. A 12-byte peek decides v2; anything shorter that
+	// still matches the v2 prefix is a truncated v2 signature.
+	signature, err = peekPrefix(reader, 12)
+	if err != nil {
+		return nil, err
+	}
+	if bytes.Equal(signature[:12], SIGV2) {
+		return parseVersion2(reader)
+	}
+
+	// The bytes begin with a shared signature prefix but complete neither
+	// signature (e.g. "PROXjunk"). No PROXY header is present.
 	return nil, ErrNoProxyProtocol
+}
+
+// peekPrefix peeks n bytes without consuming them. A clean EOF after the
+// connection already produced a PROXY signature prefix means the header was
+// truncated mid-signature, which must surface as
+// ErrIncompleteProxyProtocolSignature rather than be guessed as a
+// headerless stream. Any other read error is propagated unchanged so a
+// transport failure is never mistaken for the absence of a header.
+func peekPrefix(reader *bufio.Reader, n int) ([]byte, error) {
+	prefix, err := reader.Peek(n)
+	if err == nil {
+		return prefix, nil
+	}
+	if errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("%w: %w", ErrIncompleteProxyProtocolSignature, io.ErrUnexpectedEOF)
+	}
+	return nil, err
+}
+
+// hasBufferedSignaturePrefix reports whether reader already holds a non-empty
+// prefix of a PROXY protocol signature without blocking. It is used after a
+// read times out: signature bytes already in the buffer prove the peer started
+// a PROXY header, so the timeout must be treated as a truncated header rather
+// than a headerless stream. A full signature that reached a parser never lands
+// here, because the parser would then block (and time out) on later bytes and
+// return its own parse error instead.
+func hasBufferedSignaturePrefix(reader *bufio.Reader) bool {
+	n := reader.Buffered()
+	if n == 0 {
+		return false
+	}
+	prefix, err := reader.Peek(n)
+	if err != nil {
+		return false
+	}
+	if len(prefix) >= len(SIGV1) && bytes.Equal(prefix[:len(SIGV1)], SIGV1) {
+		return true
+	}
+	if len(prefix) >= len(SIGV2) && bytes.Equal(prefix[:len(SIGV2)], SIGV2) {
+		return true
+	}
+	return bytes.HasPrefix(SIGV1, prefix) || bytes.HasPrefix(SIGV2, prefix)
 }
 
 // ReadTimeout acts as Read but takes a timeout. If that timeout is reached, it's assumed

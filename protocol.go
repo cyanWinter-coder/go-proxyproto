@@ -93,6 +93,13 @@ type Conn struct {
 	readErr      error
 	conn         net.Conn
 	bufReader    *bufio.Reader
+	// readMu serializes the buffered-read drain in Read and WriteTo. The header
+	// transaction itself runs once under `once`, but once it has completed several
+	// goroutines may call Read concurrently and race on bufReader (including the
+	// hand-off that nils it after the buffer is drained), so the buffer and its
+	// teardown are guarded here. Reads that fall through to the underlying conn
+	// are no less safe than concurrent reads on a bare net.Conn.
+	readMu sync.Mutex
 	// bufferSize is set when the client overrides via WithBufferSize; nil means use default.
 	bufferSize        *int
 	header            *Header
@@ -274,7 +281,9 @@ func (p *Conn) Read(b []byte) (int, error) {
 		return 0, err
 	}
 
-	// Drain the buffer if it exists and has data.
+	// Drain the buffer if it exists and has data. Serialized with readMu so a
+	// concurrent Read cannot race on bufReader or tear it down twice.
+	p.readMu.Lock()
 	if p.bufReader != nil {
 		if p.bufReader.Buffered() > 0 {
 			n, err := p.bufReader.Read(b)
@@ -286,6 +295,7 @@ func (p *Conn) Read(b []byte) (int, error) {
 				// Garbage collect the buffer.
 				p.bufReader = nil
 			}
+			p.readMu.Unlock()
 
 			// Return immediately. Do not touch p.conn.
 			// If err is EOF here, it means the connection is actually closed,
@@ -296,6 +306,7 @@ func (p *Conn) Read(b []byte) (int, error) {
 		// but good for safety), clear it.
 		p.bufReader = nil
 	}
+	p.readMu.Unlock()
 
 	// From now on, read directly from the underlying connection.
 	return p.conn.Read(b)
@@ -456,7 +467,17 @@ func (p *Conn) readHeader() error {
 		// a header nor an error of its own.
 		restoreErr := p.conn.SetReadDeadline(t.(time.Time))
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			err = ErrNoProxyProtocol
+			// Signature bytes already buffered prove the peer began a PROXY
+			// header but stalled before completing it: this is a truncated
+			// header, not a headerless stream. Reporting ErrNoProxyProtocol
+			// here would let an optional-header policy (USE/IGNORE) serve those
+			// signature bytes as application data, misclassifying the
+			// connection (unified-header rule 1).
+			if hasBufferedSignaturePrefix(p.bufReader) {
+				err = fmt.Errorf("%w: %w", ErrIncompleteProxyProtocolSignature, err)
+			} else {
+				err = ErrNoProxyProtocol
+			}
 		} else if err == nil && header == nil {
 			err = restoreErr
 		}
@@ -524,8 +545,12 @@ func (p *Conn) WriteTo(w io.Writer) (int64, error) {
 		return 0, err
 	}
 
+	// Serialize the buffer inspection/teardown against concurrent Read/WriteTo.
+	p.readMu.Lock()
+
 	// If the buffer has been cleared, copy directly from conn.
 	if p.bufReader == nil {
+		p.readMu.Unlock()
 		return io.Copy(w, p.conn)
 	}
 
@@ -533,22 +558,26 @@ func (p *Conn) WriteTo(w io.Writer) (int64, error) {
 	if p.bufReader.Buffered() == 0 {
 		// Check for pending errors.
 		if _, err := p.bufReader.Read(nil); err != nil {
+			p.readMu.Unlock()
 			return 0, err
 		}
 
 		// Garbage collect the buffer.
 		p.bufReader = nil
+		p.readMu.Unlock()
 
 		return io.Copy(w, p.conn)
 	}
 
 	b := make([]byte, p.bufReader.Buffered())
 	if _, err := io.ReadFull(p.bufReader, b); err != nil {
+		p.readMu.Unlock()
 		return 0, err // this should never happen as we read buffered data.
 	}
 
 	// Garbage collect the buffer.
 	p.bufReader = nil
+	p.readMu.Unlock()
 
 	var n int64
 	{

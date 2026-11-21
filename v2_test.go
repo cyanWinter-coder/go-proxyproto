@@ -97,9 +97,12 @@ var invalidParseV2Tests = []struct {
 		expectedError: ErrNoProxyProtocol,
 	},
 	{
-		desc:          "truncated v2 signature",
+		desc: "truncated v2 signature",
+		// SIGV2[2:] still opens with the shared signature first byte, so a clean
+		// EOF before the full signature arrives is a truncated PROXY header, not
+		// a headerless stream (unified-header rule 1).
 		reader:        newBufioReader(SIGV2[2:]),
-		expectedError: ErrNoProxyProtocol,
+		expectedError: ErrIncompleteProxyProtocolSignature,
 	},
 	{
 		desc:          "v2 signature and nothing else",
