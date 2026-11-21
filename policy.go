@@ -133,6 +133,65 @@ func WithPolicy(p Policy) func(*Conn) {
 	}
 }
 
+// CommandPolicy defines how a connection is treated once a PROXY protocol
+// header has been parsed, based on the header's command. It is decided per
+// connection by CommandPolicyFunc and applies on top of — never instead of —
+// the connection's Policy: the default (a nil CommandPolicyFunc) is
+// CommandAllow for every command, which reproduces the historical behavior
+// exactly.
+type CommandPolicy int
+
+const (
+	// CommandAllow applies the connection's Policy to the parsed header as if
+	// no command policy were configured.
+	CommandAllow CommandPolicy = iota
+	// CommandDeny refuses the connection: the header has already been fully
+	// consumed from the stream — exactly its declared length, never any of
+	// the application payload that follows — and the first Read/Write fails
+	// with ErrCommandDenied, as does every subsequent one, so the connection
+	// should be closed. The denied header is not exposed via ProxyHeader.
+	CommandDeny
+	// CommandDefer accepts the connection and consumes the header but defers
+	// the trust decision to the application: the header is exposed via
+	// ProxyHeader for inspection, yet none of its addresses are applied —
+	// RemoteAddr and LocalAddr keep returning the real connection endpoints.
+	// The connection's Policy is bypassed for this header; the application
+	// takes responsibility for acting on what it inspects (or closing the
+	// connection).
+	CommandDefer
+)
+
+// CommandPolicyFunc decides how a parsed PROXY protocol command is handled.
+// It runs after the header has been fully parsed (so a denied command always
+// consumes exactly its own bytes off the stream) and before the connection's
+// Policy is applied. The cmd argument is LOCAL for both the v2 LOCAL command
+// and the v1 UNKNOWN transport, and PROXY otherwise; unknown commands never
+// reach the function — they fail parsing with
+// ErrUnsupportedProtocolVersionAndCommand.
+//
+// A typical use is refusing or deferring LOCAL health-check connections on a
+// listener whose remaining traffic must carry a verified PROXY header:
+//
+//	Listener{
+//		Listener: ln,
+//		CommandPolicy: func(cmd proxyproto.ProtocolVersionAndCommand) proxyproto.CommandPolicy {
+//			if cmd.IsLocal() {
+//				return proxyproto.CommandDeny // no health checks expected
+//			}
+//			return proxyproto.CommandAllow
+//		},
+//	}
+type CommandPolicyFunc func(cmd ProtocolVersionAndCommand) CommandPolicy
+
+// WithCommandPolicy adds a command policy function to a connection when
+// passed as option to NewConn(). A nil function means CommandAllow for every
+// command.
+func WithCommandPolicy(cp CommandPolicyFunc) func(*Conn) {
+	return func(c *Conn) {
+		c.commandPolicy = cp
+	}
+}
+
 // ConnLaxWhiteListPolicy returns a ConnPolicyFunc which decides whether the
 // upstream ip is allowed to send a proxy header based on a list of allowed
 // IP addresses and IP ranges. In case upstream IP is not in list the proxy

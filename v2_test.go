@@ -188,8 +188,9 @@ var invalidParseV2Tests = []struct {
 		reader:        newBufioReader(append(SIGV2, 0x11)),
 		expectedError: ErrUnsupportedProtocolVersionAndCommand,
 	},
-	// A LOCAL frame whose length fits its family layout is decoded like PROXY,
-	// so a truncated address block keeps reporting ErrInvalidAddress.
+	// A LOCAL frame whose length fits its family layout has its address block
+	// discarded (the spec forbids trusting it), so a truncated block keeps
+	// reporting ErrInvalidAddress.
 	{
 		desc:          "LOCAL TCPv4 with mismatching length",
 		reader:        newBufioReader(append(append(SIGV2, byte(LOCAL), byte(TCPv4)), lengthV4Bytes...)),
@@ -303,14 +304,14 @@ var validParseAndWriteV2Tests = []struct {
 	expectedHeader *Header
 }{
 	{
-		desc:   "local", // full family address block is decoded and round-trips
+		desc:   "local", // the forged address block is discarded, never decoded
 		reader: newBufioReader(append(append(SIGV2, byte(LOCAL), byte(TCPv4)), fixtureIPv4V2...)),
 		expectedHeader: &Header{
 			Version:           2,
 			Command:           LOCAL,
-			TransportProtocol: TCPv4,
-			SourceAddr:        v4addr,
-			DestinationAddr:   v4addr,
+			TransportProtocol: UNSPEC,
+			SourceAddr:        nil,
+			DestinationAddr:   nil,
 		},
 	},
 	{
@@ -443,14 +444,14 @@ var validParseAndWriteV2Tests = []struct {
 		},
 	},
 	{
-		desc:   "local unix stream with TLV",
+		desc:   "local unix stream with TLV", // address block discarded, TLVs kept
 		reader: newBufioReader(append(append(SIGV2, byte(LOCAL), byte(UnixStream)), fixtureUnixV2TLV...)),
 		expectedHeader: &Header{
 			Version:           2,
 			Command:           LOCAL,
-			TransportProtocol: UnixStream,
-			SourceAddr:        unixStreamAddr,
-			DestinationAddr:   unixStreamAddr,
+			TransportProtocol: UNSPEC,
+			SourceAddr:        nil,
+			DestinationAddr:   nil,
 			rawTLVs:           fixtureTLV,
 		},
 	},

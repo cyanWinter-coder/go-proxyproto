@@ -115,6 +115,46 @@ For UDP, `ParseUDPDatagram` has no built-in trusted-source policy because it
 only sees packet bytes. Check the `net.PacketConn.ReadFrom` sender address
 yourself before trusting `header.SourceAddr`.
 
+### Command-level semantics (LOCAL health checks)
+
+Proxies open `LOCAL` connections themselves — typically for health checks — so
+any addresses inside a `LOCAL` (v2) or `UNKNOWN` (v1) header are forged
+placeholders, never client information. The library enforces that end to end:
+
+- A parsed `LOCAL`/`UNKNOWN` header carries no addresses at all: the address
+  block is discarded during parsing (TLVs are preserved), so neither
+  `Conn.RemoteAddr`/`LocalAddr` nor `Conn.ProxyHeader().SourceAddr` can hand
+  the application a forged address. The connection endpoints are always the
+  real ones.
+- `Listener.CommandPolicy` (or `WithCommandPolicy` on a `Conn`) decides per
+  command — `CommandAllow` (the default; historical behavior),
+  `CommandDeny` (the header is consumed, exactly its declared length, then
+  every read/write fails with `ErrCommandDenied`), or `CommandDefer` (the
+  header is exposed via `ProxyHeader` for the application's own decision, but
+  its addresses are never applied). The default changes nothing for existing
+  deployments.
+- Header processing runs exactly once per connection. Bytes after the first
+  header — even a second, well-formed header — are ordinary application
+  payload and can never replace or roll back the established state.
+- Malformed headers fail with stable, `errors.Is`-matchable categories
+  (`ErrUnsupportedProtocolVersionAndCommand`,
+  `ErrUnsupportedAddressFamilyAndProtocol`, `ErrInvalidLength`,
+  `ErrInvalidAddress`, `ErrCantRead*`), and a failed connection closes
+  cleanly without affecting the listener.
+
+```go
+proxyListener := &proxyproto.Listener{
+	Listener: ln,
+	// Deny LOCAL health-check connections; apply PROXY headers as usual.
+	CommandPolicy: func(cmd proxyproto.ProtocolVersionAndCommand) proxyproto.CommandPolicy {
+		if cmd.IsLocal() {
+			return proxyproto.CommandDeny
+		}
+		return proxyproto.CommandAllow
+	},
+}
+```
+
 Related knobs are documented in the
 [package docs](https://pkg.go.dev/github.com/pires/go-proxyproto):
 `ReadHeaderTimeout` (default 10s), `MaxV2HeaderSize` (default 4KiB),

@@ -143,9 +143,8 @@ func parseVersion2(reader *bufio.Reader) (header *Header, err error) {
 		// LOCAL + TCPv4 + length 0 — is still valid: skip the block, which the
 		// spec says to discard, and normalize the header to UNSPEC so it stays
 		// serializable via Format/WriteTo. A LOCAL frame whose length does fit
-		// the family layout is instead decoded exactly like a PROXY frame
-		// below, preserving the (informational) addresses and any trailing
-		// TLVs, so the header round-trips byte for byte.
+		// the family layout has its address block discarded below (the spec
+		// forbids trusting it), preserving any trailing TLVs.
 		if header.Command == LOCAL {
 			if length > MaxV2HeaderSize {
 				return nil, ErrInvalidLength
@@ -176,7 +175,22 @@ func parseVersion2(reader *bufio.Reader) (header *Header, err error) {
 	// Ignore address information for UNSPEC, and skip straight to read TLVs,
 	// since the length is greater than zero.
 	if header.TransportProtocol != UNSPEC {
-		if header.TransportProtocol.IsIPv4() {
+		if header.Command == LOCAL {
+			// Per spec (section 2.2) a LOCAL frame's address block "must not
+			// be trusted" and the real connection endpoints must be used
+			// instead: a LOCAL connection is one the proxy opened itself
+			// (e.g. a health check), so any addresses in the header are
+			// forged placeholders. Discard the block without decoding it, so
+			// the parsed header can never leak a forged address to the
+			// application — not even through Header.SourceAddr via
+			// Conn.ProxyHeader. Trailing TLVs are still collected below, and
+			// the header is normalized to UNSPEC so it stays serializable via
+			// Format/WriteTo.
+			if _, err := io.CopyN(io.Discard, payloadReader, int64(addressBlockLength(header.TransportProtocol))); err != nil {
+				return nil, fmt.Errorf("%w: %w", ErrInvalidAddress, err)
+			}
+			header.TransportProtocol = UNSPEC
+		} else if header.TransportProtocol.IsIPv4() {
 			var addr _addr4
 			if err := binary.Read(payloadReader, binary.BigEndian, &addr); err != nil {
 				return nil, fmt.Errorf("%w: %w", ErrInvalidAddress, err)
@@ -311,6 +325,21 @@ func (header *Header) validateLength(length uint16) bool {
 		return length >= lengthUnspec
 	}
 	return false
+}
+
+// addressBlockLength returns the number of bytes the address block occupies
+// for the given address family and protocol, or 0 for UNSPEC and undefined
+// families (which carry no address block).
+func addressBlockLength(transport AddressFamilyAndProtocol) uint16 {
+	switch {
+	case transport.IsIPv4():
+		return lengthV4
+	case transport.IsIPv6():
+		return lengthV6
+	case transport.IsUnix():
+		return lengthUnix
+	}
+	return lengthUnspec
 }
 
 // addTLVLen adds the length of the TLV to the header length or errors on uint16 overflow.

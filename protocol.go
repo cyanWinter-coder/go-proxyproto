@@ -72,6 +72,13 @@ type Listener struct {
 	Policy PolicyFunc
 	// ConnPolicy is the policy function for accepted connections.
 	ConnPolicy ConnPolicyFunc
+	// CommandPolicy is the command policy function for accepted connections.
+	// It decides, per parsed PROXY protocol command (PROXY, or LOCAL for both
+	// the v2 LOCAL command and the v1 UNKNOWN transport), whether the header
+	// is applied per the connection policy (CommandAllow, the default when
+	// nil), the connection is refused with ErrCommandDenied (CommandDeny), or
+	// the header is consumed without applying its addresses (CommandDefer).
+	CommandPolicy CommandPolicyFunc
 	// ValidateHeader is the validator function for the proxy header.
 	ValidateHeader Validator
 	// ReadHeaderTimeout is the timeout for reading the proxy header.
@@ -98,6 +105,13 @@ type Conn struct {
 	header            *Header
 	ProxyHeaderPolicy Policy
 	Validate          Validator
+	// commandPolicy decides per-command handling of a parsed header; nil
+	// means CommandAllow for every command.
+	commandPolicy CommandPolicyFunc
+	// commandDeferred records that the parsed header was accepted under
+	// CommandDefer: it is exposed via ProxyHeader but its addresses are never
+	// applied to RemoteAddr/LocalAddr.
+	commandDeferred   bool
 	readHeaderTimeout time.Duration
 }
 
@@ -191,6 +205,7 @@ func (p *Listener) Accept() (net.Conn, error) {
 		opts := []func(*Conn){
 			WithPolicy(proxyHeaderPolicy),
 			ValidateHeader(p.ValidateHeader),
+			WithCommandPolicy(p.CommandPolicy),
 		}
 		if p.ReadBufferSize > 0 {
 			opts = append(opts, WithBufferSize(p.ReadBufferSize))
@@ -328,11 +343,13 @@ func (p *Conn) ProxyHeader() *Header {
 // the socket server. In case an error happens on reading the
 // proxy header the original LocalAddr is returned, not the one
 // from the proxy header even if the proxy header itself is
-// syntactically correct.
+// syntactically correct. The same holds when the header's command was
+// deferred by the command policy (CommandDefer): the header is available
+// via ProxyHeader but its addresses are not applied.
 func (p *Conn) LocalAddr() net.Addr {
 	// Ensure header processing runs at most once.
 	_ = p.ensureHeaderProcessed()
-	if p.header == nil || p.header.Command.IsLocal() || p.readErr != nil || p.header.DestinationAddr == nil {
+	if p.header == nil || p.header.Command.IsLocal() || p.commandDeferred || p.readErr != nil || p.header.DestinationAddr == nil {
 		return p.conn.LocalAddr()
 	}
 
@@ -344,11 +361,13 @@ func (p *Conn) LocalAddr() net.Addr {
 // the socket peer. In case an error happens on reading the
 // proxy header the original RemoteAddr is returned, not the one
 // from the proxy header even if the proxy header itself is
-// syntactically correct.
+// syntactically correct. The same holds when the header's command was
+// deferred by the command policy (CommandDefer): the header is available
+// via ProxyHeader but its addresses are not applied.
 func (p *Conn) RemoteAddr() net.Addr {
 	// Ensure header processing runs at most once.
 	_ = p.ensureHeaderProcessed()
-	if p.header == nil || p.header.Command.IsLocal() || p.readErr != nil || p.header.SourceAddr == nil {
+	if p.header == nil || p.header.Command.IsLocal() || p.commandDeferred || p.readErr != nil || p.header.SourceAddr == nil {
 		return p.conn.RemoteAddr()
 	}
 
@@ -475,6 +494,22 @@ func (p *Conn) readHeader() error {
 
 	// proxy protocol header was found
 	if err == nil && header != nil {
+		// The command policy runs first, on the fully parsed header: whatever
+		// it decides, exactly the header's declared bytes — and nothing of the
+		// application payload that may follow — have been consumed.
+		switch p.commandPolicyFor(header.Command) {
+		case CommandDeny:
+			// This connection is not allowed to use this command. The denied
+			// header is neither applied nor exposed.
+			return ErrCommandDenied
+		case CommandDefer:
+			// Accept the connection and expose the header for application
+			// inspection, but apply none of its addresses: RemoteAddr and
+			// LocalAddr keep returning the real connection endpoints.
+			p.header = header
+			p.commandDeferred = true
+			return nil
+		}
 		switch p.ProxyHeaderPolicy {
 		case REJECT:
 			// this connection is not allowed to send one
@@ -492,6 +527,15 @@ func (p *Conn) readHeader() error {
 	}
 
 	return err
+}
+
+// commandPolicyFor resolves the command policy for a parsed command, defaulting
+// to CommandAllow when no CommandPolicyFunc is configured.
+func (p *Conn) commandPolicyFor(cmd ProtocolVersionAndCommand) CommandPolicy {
+	if p.commandPolicy == nil {
+		return CommandAllow
+	}
+	return p.commandPolicy(cmd)
 }
 
 // ensureHeaderProcessed runs header processing once.

@@ -64,17 +64,20 @@ func TestV2UndefinedTransportRejected(t *testing.T) {
 // TestParseV2LocalAddressBlock pins spec-conformant LOCAL handling (section
 // 2.2). The receiver must use the real connection endpoints for LOCAL, must
 // skip exactly `length` payload bytes, and "must not assume zero is presented
-// for LOCAL connections". Two shapes follow from that:
+// for LOCAL connections". Because a LOCAL connection is one the proxy opened
+// itself (e.g. a health check), any addresses inside the header are forged
+// placeholders, so the address block is never decoded:
 //
-//   - A LOCAL frame whose length fits its declared family layout is decoded
-//     like a PROXY frame: informational addresses and trailing TLVs are
-//     preserved, so the header can round-trip through Format/WriteTo.
+//   - A LOCAL frame whose length fits its declared family layout has its
+//     address block discarded and is normalized to UNSPEC; trailing TLVs are
+//     preserved, so the header stays serializable through Format/WriteTo.
 //   - A LOCAL frame whose length does not fit the family layout (e.g.
 //     LOCAL + TCPv4 + len 0) is still valid; its payload is skipped and the
 //     header is normalized to UNSPEC so it remains serializable.
 //
-// Either way Conn.RemoteAddr/LocalAddr fall back to the real endpoints via
-// IsLocal, and every accepted header must Format without error.
+// Either way the parsed header carries no addresses at all,
+// Conn.RemoteAddr/LocalAddr fall back to the real endpoints via IsLocal, and
+// every accepted header must Format without error.
 func TestParseV2LocalAddressBlock(t *testing.T) {
 	localTLV := []byte{0x01, 0x00, 0x01, 0xAA}
 	fullV4Block := make([]byte, int(lengthV4))
@@ -90,9 +93,9 @@ func TestParseV2LocalAddressBlock(t *testing.T) {
 	}{
 		{"UNSPEC, empty", byte(UNSPEC), nil, UNSPEC, false, nil},
 		{"UNSPEC, TLV payload preserved", byte(UNSPEC), localTLV, UNSPEC, false, localTLV},
-		{"TCPv4 with a full address block decoded", byte(TCPv4), fullV4Block, TCPv4, true, nil},
-		{"UDPv4 with a full address block decoded", byte(UDPv4), fullV4Block, UDPv4, true, nil},
-		{"TCPv4 with address block and TLVs preserved", byte(TCPv4), append(bytes.Clone(fullV4Block), localTLV...), TCPv4, true, localTLV},
+		{"TCPv4 address block discarded", byte(TCPv4), fullV4Block, UNSPEC, false, nil},
+		{"UDPv4 address block discarded", byte(UDPv4), fullV4Block, UNSPEC, false, nil},
+		{"TCPv4 address block discarded, TLVs preserved", byte(TCPv4), append(bytes.Clone(fullV4Block), localTLV...), UNSPEC, false, localTLV},
 		{"TCPv4 with len 0 normalized to UNSPEC", byte(TCPv4), nil, UNSPEC, false, nil},
 		{"TCPv4 with short block skipped and normalized", byte(TCPv4), shortBlock, UNSPEC, false, nil},
 	}
@@ -127,11 +130,14 @@ func TestParseV2LocalAddressBlock(t *testing.T) {
 }
 
 // TestParseV2RoundTrip pins byte-for-byte round-tripping — the relay use case
-// (Read then WriteTo toward a backend) — for frames carrying a full family
-// address block plus TLVs. The Unix cases guard the declared-length accounting:
-// formatVersion2 used to write the fixed 216-byte Unix length while appending
-// TLVs after the block, leaving a downstream parser to read the TLV bytes as
-// application payload.
+// (Read then WriteTo toward a backend) — for PROXY frames carrying a full
+// family address block plus TLVs. The Unix case guards the declared-length
+// accounting: formatVersion2 used to write the fixed 216-byte Unix length
+// while appending TLVs after the block, leaving a downstream parser to read
+// the TLV bytes as application payload. LOCAL frames are excluded on purpose:
+// their address block is forged by definition and discarded on parse (see
+// TestParseV2LocalAddressBlock), so they round-trip to the normalized UNSPEC
+// form, not byte for byte.
 func TestParseV2RoundTrip(t *testing.T) {
 	tlv := []byte{0x01, 0x00, 0x01, 0xAA}
 	v4Block := []byte{1, 2, 3, 4, 5, 6, 7, 8, 0, 80, 1, 187}
@@ -145,8 +151,7 @@ func TestParseV2RoundTrip(t *testing.T) {
 		transport AddressFamilyAndProtocol
 		block     []byte
 	}{
-		{"LOCAL TCPv4 with TLV", LOCAL, TCPv4, v4Block},
-		{"LOCAL UnixStream with TLV", LOCAL, UnixStream, unixBlock},
+		{"PROXY TCPv4 with TLV", PROXY, TCPv4, v4Block},
 		{"PROXY UnixStream with TLV", PROXY, UnixStream, unixBlock},
 	}
 	for _, tc := range cases {

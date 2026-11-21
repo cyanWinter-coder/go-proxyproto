@@ -56,6 +56,11 @@ var (
 	ErrInvalidPortNumber = errors.New("proxyproto: invalid port number")
 	// ErrSuperfluousProxyHeader indicates an upstream connection sent a PROXY header but isn't allowed to send one.
 	ErrSuperfluousProxyHeader = errors.New("proxyproto: upstream connection sent PROXY header but isn't allowed to send one")
+	// ErrCommandDenied indicates a parsed PROXY protocol command was denied by
+	// the connection's command policy (see CommandPolicyFunc). The header was
+	// fully consumed — exactly its declared length, no application payload —
+	// before the connection was refused.
+	ErrCommandDenied = errors.New("proxyproto: PROXY protocol command denied by command policy")
 )
 
 // Header is the placeholder for proxy protocol header.
