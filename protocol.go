@@ -55,7 +55,8 @@ var (
 // Listener is stream-oriented (TCP, Unix stream): the header is read once at
 // the start of the byte stream. It cannot implement the PROXY protocol over
 // UDP, where the spec requires a header parsed independently in each datagram;
-// use ParseUDPDatagram and Header.FormatUDPDatagram for that.
+// use ParseUDPDatagram and Header.FormatUDPDatagram for stateless parsing, or
+// NewUDPPacketConn to wrap a net.PacketConn.
 //
 // Note that ReadHeaderTimeout only bounds how long a single slow connection can
 // hold a goroutine and file descriptor during header detection; it is not a

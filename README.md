@@ -12,8 +12,9 @@ client connection information across NAT and proxy layers.
 
 Use it on either side of a PROXY-aware hop: send headers with `Header.WriteTo`
 or `Header.FormatUDPDatagram`, and receive them with `Listener`, `NewConn`,
-`Read`, or `ParseUDPDatagram`. The stream APIs are for TCP and Unix streams;
-UDP uses packet helpers because the spec requires a header in every datagram.
+`Read`, `ParseUDPDatagram`, or the `NewUDPPacketConn` wrapper. The stream APIs
+are for TCP and Unix streams; UDP uses packet APIs because the spec requires a
+header in every datagram.
 
 ## Installation
 
@@ -36,7 +37,7 @@ The fastest way to get started is the runnable programs under
 | HTTP server | [`examples/httpserver`](examples/httpserver) |
 | Server + client over TLS (PROXY header before TLS) | [`examples/tlsserver`](examples/tlsserver), [`examples/tlsclient`](examples/tlsclient) |
 | UDP receiver and sender | [`examples/udpserver`](examples/udpserver), [`examples/udpclient`](examples/udpclient) |
-| UDP `net.PacketConn` wrapper pattern | [`examples/udppacketconn`](examples/udppacketconn) |
+| UDP `net.PacketConn` wrapper | [`examples/udppacketconn`](examples/udppacketconn) |
 | `Listener`, `NewConn`, `Read`, UDP, and TLS API examples | [Package examples](https://pkg.go.dev/github.com/pires/go-proxyproto#pkg-examples) |
 
 ## Usage
@@ -113,7 +114,9 @@ proxyListener := &proxyproto.Listener{
 
 For UDP, `ParseUDPDatagram` has no built-in trusted-source policy because it
 only sees packet bytes. Check the `net.PacketConn.ReadFrom` sender address
-yourself before trusting `header.SourceAddr`.
+yourself before trusting `header.SourceAddr`; `UDPPacketConn` exposes the same
+sender through `DropHook` and the header through `ReadFromProxy` for that
+check.
 
 Related knobs are documented in the
 [package docs](https://pkg.go.dev/github.com/pires/go-proxyproto):
@@ -124,25 +127,37 @@ Related knobs are documented in the
 
 The spec requires the header and proxied payload in the same UDP datagram, and
 the receiver must parse the header independently for every datagram. `Listener`
-and `Conn` cannot provide those semantics; use `ParseUDPDatagram` and
-`Header.FormatUDPDatagram` with your own `net.PacketConn`. Headers with
-`UDPv4`/`UDPv6` families carried over stream connections describe the proxied
-protocol and remain fully supported.
+and `Conn` are stream-oriented and cannot provide those semantics. Two levels of
+API are available:
+
+- `ParseUDPDatagram` and `Header.FormatUDPDatagram` are the stateless packet
+  helpers, for code that already owns its `net.PacketConn` read loop.
+- `NewUDPPacketConn` wraps a `net.PacketConn` as a `net.PacketConn`. Each
+  `ReadFrom` consumes exactly one datagram, parses at most one header out of it,
+  and returns the proxied payload. A header is never completed with bytes from
+  the next datagram, and a datagram whose declared header does not fit is
+  dropped (`ErrDatagramTruncated`) instead of borrowing the next one.
+  `ReadFrom` reports the client address carried by the header, or the relaying
+  proxy for LOCAL datagrams; `WriteTo` routes replies back through the proxy
+  that relayed for that client via a bounded client-to-proxy flow table
+  (`UDPPacketConnOptions.MaxFlows`, LRU eviction).
+
+Headers with `UDPv4`/`UDPv6` families carried over stream connections describe
+the proxied protocol and remain fully supported.
 
 - [`examples/udpserver`](examples/udpserver) and
   [`examples/udpclient`](examples/udpclient) show direct per-datagram parsing
   and formatting.
-- [`examples/udppacketconn`](examples/udppacketconn) sketches a
-  `net.PacketConn` wrapper with reply routing through the relaying proxy.
+- [`examples/udppacketconn`](examples/udppacketconn) wraps a socket with
+  `NewUDPPacketConn` and shows reply routing through the relaying proxy.
 - [`ExampleParseUDPDatagram`](https://pkg.go.dev/github.com/pires/go-proxyproto#example-ParseUDPDatagram)
   and
   [`ExampleHeader_FormatUDPDatagram`](https://pkg.go.dev/github.com/pires/go-proxyproto#example-Header.FormatUDPDatagram)
   show the same APIs as package examples.
 
-The library deliberately does not export a `net.PacketConn` wrapper. A wrapper
-that returns the client address from the header also needs an application-owned
-client-to-proxy flow table for replies, including bounds, expiry, and spoofing
-policy.
+`UDPPacketConn` still cannot decide whether a sender is a trusted proxy: it sees
+only packet bytes. Bound the flow table (`MaxFlows`), use `DropHook` to observe
+drops, and reject datagrams from untrusted senders yourself.
 
 ### TLS
 
